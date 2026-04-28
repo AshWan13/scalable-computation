@@ -1,0 +1,9 @@
+# Core runtime dependencies (pure classes + configs)
+numpy>=1.21
+pyyaml>=6.0
+scipy>=1.7
+
+# Optional — install via pip install -e ".[matplotlib]" or ".[pygame]" or ".[dev]"
+# matplotlib>=3.5
+# pygame>=2.1
+# pytest>=7.0

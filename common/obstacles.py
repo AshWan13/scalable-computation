@@ -43,7 +43,7 @@ class ObstacleKind(Enum):
     SLIDING_DOOR  = auto()
     PIVOT_DOOR    = auto()
     HUMAN         = auto()
-    # Robot-mountable accessory (Phase E / Pressing 5)
+    # Robot-mountable accessory (Mode 5)
     MDA_MODULE    = auto()      # mobile dual-arm module — pre-mount free
                                 # obstacle, post-mount attached to a robot
 
@@ -224,7 +224,7 @@ class Obstacle:
     _custom_half_w: Optional[float] = field(default=None, repr=False)
     _custom_half_h: Optional[float] = field(default=None, repr=False)
 
-    # ---- MDA mount state (Phase E / Pressing 5) ------------------------
+    # ---- MDA mount state (Mode 5) --------------------------------------
     # When this obstacle is an MDA_MODULE, host_robot_id is None pre-mount
     # and set to the host's robot_id post-mount.  Mounted MDAs are excluded
     # from collision/occupancy/drag — the host robot's footprint inflates
@@ -703,7 +703,7 @@ class ObstacleManager:
             if obs.kind in _TICKED and obs.uid != self.dragging_id:
                 obs.tick_dynamic(dt, world_bounds)
 
-    # ---- MDA mount / unmount (Phase E / Pressing 5) --------------------
+    # ---- MDA mount / unmount (Mode 5) ----------------------------------
 
     def find_mda_for_robot(self, robot_id: int) -> Optional[Obstacle]:
         """Return the MDA module mounted on the given robot, or None."""

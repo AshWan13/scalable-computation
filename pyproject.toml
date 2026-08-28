@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scalable-computation"
-version = "0.1.0"
+version = "1.1.0"
 description = "Towards Computationally Scalable Inter-Reconfigurable Robots — PhD thesis codebase"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -50,4 +50,4 @@ Issues = "https://github.com/AshWan13/scalable-computation/issues"
 
 [tool.setuptools]
 py-modules = ["demo"]
-packages = ["common", "configurer", "interstar", "gbnnh"]
+packages = ["common", "configurer", "interstar", "igbnnmu", "gbnnh"]

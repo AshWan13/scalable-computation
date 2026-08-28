@@ -783,7 +783,7 @@ class RoIFrame:
       (e.g. wall), this is the world's -z direction; for a horizontal
       surface (e.g. tabletop), it is back into the surface away from the
       base (yaw direction).
-    * For Phase E pygame integration we use the projected-floor mapping:
+    * For the pygame integration we use the projected-floor mapping:
       i runs along the yaw direction (away from base), j runs along the
       perpendicular (right of base).  That keeps the surface-view panel
       and the floor view consistent for floor-projected RoIs.

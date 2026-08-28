@@ -9,14 +9,14 @@ Layered as follows:
                              SimBus + TeleopSim + matplotlib `demo` helper +
                              the _run_pygame_teleop launcher + main entry.
                              Provides the full reference teleop sandbox.
-  Section 2 (further below) — Phase A additions:
+  Section 2 (further below) — planner-layer additions:
                              Planner ABC, GBNNBasePlanner, NavController,
                              ReconfigSequencer, PlannerRegistry, EventHandler,
                              LMB-drag → GBNN coverage with heatmap overlay,
-                             headless test suite, SB3 PPO load spike.
+                             headless test suite.
 
 Configurer.py keeps its full standalone teleop sandbox; this file is the
-mode-1 host that Phases B–E adapters will plug into.
+mode-1 host that planner adapters plug into.
 """
 
 # ---------------------------------------------------------------------------
@@ -40,10 +40,10 @@ from configurer.open_configurer import Configurer, Twist, Pose, FSMState
 # pygame is imported lazily inside _run_pygame_teleop() — matches Configurer.
 
 # ===========================================================================
-# Section 0 (Phase A) — Contracts, GBNN adapter, helper imports
+# Section 0 — Contracts, GBNN adapter, helper imports
 # ===========================================================================
 #
-# These types + classes are the integration surface for Phases B–E.  They
+# These types + classes are the integration surface for the planner adapters.  They
 # sit at module scope so the verbatim TeleopSim copy below can call into
 # them with minimal surgery.  Configurer.py is NOT modified.
 # ===========================================================================
@@ -55,6 +55,7 @@ from common.obstacles import (
     MDA_ARM_RADIUS, MDA_ARM_REACH_M, MDA_ARM_FOV_DEG, MDA_MOUNT_RANGE_M,
 )
 from common.replicated_gbnn import GBNN
+from igbnnmu.open_igbnnmu import IGBNN_mu
 from gbnnh.open_gbnnh import GBNN_H, RoIFrame, AccessPoint
 
 # ---- type aliases ----
@@ -92,11 +93,57 @@ class Rect:
         return abs(self.y1 - self.y0)
 
 
+def _obb_overlap(
+    ax: float, ay: float, ayaw: float,
+    bx: float, by: float, byaw: float,
+    half: float,
+) -> Optional[Tuple[float, float, float]]:
+    """Separating-axis test between two SQUARE robot footprints.
+
+    Both robots are `2*half` on a side and may carry any yaw.  Returns
+    the minimum translation vector as ``(ux, uy, depth)``, a unit
+    direction pushing A off B plus the penetration depth along it, or
+    None when the two squares do not overlap.
+
+    Why this exists: everywhere else demo.py models a robot as a circle
+    of radius ROBOT_OCCUPANCY_M -- the CIRCUMSCRIBED circle, 1.41x the
+    body half-width -- so two robots register contact at
+    DOCKED_DISTANCE_M (0.99 m) while their square bodies are still
+    0.29 m apart.  That is harmless when the spacing in play is docking
+    distance, and wrong when it is a coverage grid pitched at one robot
+    footprint (0.70 m): the circles overlap on every cardinally adjacent
+    pair, so the resolver shoves robots that are merely side by side.
+    Mode 3 therefore separates participants on the polygon.
+
+    Four axes suffice for two rectangles -- each box contributes its own
+    two edge normals -- and for a square the two normals are just the
+    yaw-rotated x and y axes.
+    """
+    ca, sa = math.cos(ayaw), math.sin(ayaw)
+    cb, sb = math.cos(byaw), math.sin(byaw)
+    dx, dy = ax - bx, ay - by
+    best: Optional[Tuple[float, float, float]] = None
+    for ux, uy in ((ca, sa), (-sa, ca), (cb, sb), (-sb, cb)):
+        # Projection radius of each square onto this axis: the support
+        # function of a box, |half*e1.u| + |half*e2.u| for edge axes e1,e2.
+        ra = half * (abs(ca * ux + sa * uy) + abs(-sa * ux + ca * uy))
+        rb = half * (abs(cb * ux + sb * uy) + abs(-sb * ux + cb * uy))
+        sep = dx * ux + dy * uy
+        depth = ra + rb - abs(sep)
+        if depth <= 0.0:
+            return None                      # a separating axis exists
+        if best is None or depth < best[2]:
+            sign = 1.0 if sep >= 0.0 else -1.0
+            best = (ux * sign, uy * sign, depth)
+    return best
+
+
 class PlannerMode(Enum):
     """Active planner mode (mode 1 = the verbatim Configurer demo)."""
     MANUAL    = 1   # WASD + LMB-click P2P + LMB-drag GBNN coverage
-    INTERSTAR = 2   # Phase B
-    GBNNH     = 5   # Phase E
+    INTERSTAR = 2
+    IGBNNMU   = 3
+    GBNNH     = 5
 
 
 @dataclass
@@ -170,7 +217,7 @@ class Planner(ABC):
 # ---------------------------------------------------------------------------
 # DefaultPlanner — wraps the existing pathfind_astar for completeness.
 # (The verbatim TeleopSim already uses A*/Dijkstra directly; this adapter
-#  exists so Phases B–E can call DefaultPlanner.plan() uniformly.)
+#  exists so the planner adapters can call DefaultPlanner.plan() uniformly.)
 # ---------------------------------------------------------------------------
 
 class DefaultPlanner(Planner):
@@ -606,7 +653,7 @@ class InterstarPlanner(Planner):
     """Inter-Star adapter — multi-robot fusion (convergence) or fission
     (divergence) with shared-path exploitation.
 
-    Per Phase B B1, the Interstar class now accepts explicit starts +
+    Per the Inter-Star integration, the Interstar class now accepts explicit starts +
     fission_start + mode + numpy grid and returns shared-path metrics via
     its `plan()` classmethod.  This adapter is a thin shim that:
       1. Rasterises the world obstacles to a numpy grid
@@ -841,7 +888,7 @@ class InterstarPlanner(Planner):
 # ---------------------------------------------------------------------------
 # ReconfigSequencer — FIFO of ReconfigCommands fired into Configurer FSMs
 # ---------------------------------------------------------------------------
-# Phase A does not produce reconfig commands (mode 1 = single-robot teleop /
+# Mode 1 does not produce reconfig commands (mode 1 = single-robot teleop /
 # coverage); future adapters may emit them.  This scaffold class lets the demo
 # accept a `List[ReconfigCommand]` from any adapter and dispatch them as fast
 # as the pairwise FSM handshake allows — paper-faithful per Configurer paper, Table I.
@@ -855,7 +902,7 @@ class ReconfigSequencer:
     pairwise handshake completes.  N-robot fusion is dispatched as (N-1)
     pairwise FUSEs scheduled in order via the `when` field.
 
-    Phase A: instantiated by TeleopSim, idle (queue stays empty).
+    Mode 1: instantiated by TeleopSim, idle (queue stays empty).
     Future adapters extend the queue via `enqueue` / `extend`.
     """
 
@@ -902,8 +949,8 @@ class ReconfigSequencer:
 # ---------------------------------------------------------------------------
 # PlannerRegistry — named-handle lookup of Planner adapter instances
 # ---------------------------------------------------------------------------
-# Used in Phase A by TeleopSim to hold the singletons of DefaultPlanner and
-# GBNNBasePlanner.  Phases B and E register InterstarPlanner and GBNNHPlanner
+# Used by TeleopSim to hold the singletons of DefaultPlanner and
+# GBNNBasePlanner.  Inter-Star and GBNN+H register InterstarPlanner and GBNNHPlanner
 # under their own keys — the EventHandler then resolves "which planner do I
 # dispatch to" via `registry.get(key)`.
 
@@ -911,11 +958,11 @@ class ReconfigSequencer:
 class PlannerRegistry:
     """Central named-handle registry of Planner adapter instances.
 
-    Phase A keys (registered by TeleopSim.__init__):
+    Default keys (registered by TeleopSim.__init__):
         "default" → DefaultPlanner   (P2P A* — used by mode-1 LMB-click)
         "gbnn"    → GBNNBasePlanner  (RoI coverage — used by mode-1 LMB-drag)
 
-    Phase B+ adds: "interstar", "gbnnh".
+    Later planners add: "interstar", "gbnnh".
     """
 
     def __init__(self) -> None:
@@ -1344,7 +1391,7 @@ def demo(n_robots: int = 3, visualize: bool = True) -> None:
 #   ESC                  quit
 # ============================================================================
 
-def _run_pygame_teleop() -> int:
+def _run_pygame_teleop(_return_class: bool = False) -> int:
     """
     Interactive pygame teleop sandbox.  Entry point for `python Configurer.py`.
 
@@ -1650,7 +1697,7 @@ def _run_pygame_teleop() -> int:
             self._gbnn_drag_armed:   bool = False
             self.GBNN_DRAG_THRESHOLD_PX: int = 10
 
-            # ---- Phase B (Interstar) state ----
+            # ---- Inter-Star state ----
             # Multi-robot Ctrl+click selection (B3)
             self._selected_ids:  set = set()
             # Interstar adapter + last-plan state (B2 / B8 / B10)
@@ -1757,7 +1804,7 @@ def _run_pygame_teleop() -> int:
             self.INTERSTAR_REPLAN_INTERVAL: int = 15   # 2 Hz at 30 FPS
 
             # ============================================================
-            # Phase E (Pressing 5) — GBNN+H surface cleaning state
+            # Mode 5 — GBNN+H surface cleaning state
             # ============================================================
             # Lifecycle (revised):
             #   1. Mount an MDA on a robot via key '0'.
@@ -1788,7 +1835,7 @@ def _run_pygame_teleop() -> int:
             # `roi_segments` list, or None when no AP is being cleaned
             # (en route, yaw aligning, or run finished).
             self._gbnnh_active_seg_idx: Optional[int] = None
-            # Legacy planner field kept None — Phase E v3 switched to
+            # Legacy planner field kept None — GBNN+H v3 switched to
             # segment-based sweep cleaning; the GBNN_H grid planner is
             # no longer instantiated.  Field retained as a "cleaning
             # phase started" sentinel for code paths that still test it.
@@ -1850,19 +1897,181 @@ def _run_pygame_teleop() -> int:
             self.GBNNH_STALL_MOVE_TOL_M: float = 0.02   # < 2 cm/frame
             self.GBNNH_STALL_FRAME_LIMIT: int = 90       # 3 s at 30 FPS
 
-            # Reusable adapter instances (also let Phases B-E hot-swap)
+            # ---------------- PHASE C (Mode 3) - IGBNN-mu ----------------
+            # Multi-robot complete coverage with inter-reconfiguration.
+            # Armed by Ctrl+LMB-drag, started by Enter, cleared by Esc.
+            #
+            # Lifecycle of the three booleans:
+            #   armed        _igbnnmu_planner is not None, _igbnnmu_started False
+            #   approaching  _igbnnmu_active and _igbnnmu_approach   (driving to
+            #                the entry edge the planner picked)
+            #   sweeping     _igbnnmu_active and not _igbnnmu_approach
+            #   finished     _igbnnmu_planner set, _igbnnmu_active False,
+            #                _igbnnmu_stats populated (overlay stays up)
+            self._igbnnmu_planner: Optional["IGBNN_mu"] = None
+            self._igbnnmu_roi:     Optional["Rect"] = None
+            self._igbnnmu_hosts:   List[int] = []
+            self._igbnnmu_active:   bool = False
+            self._igbnnmu_started:  bool = False
+            self._igbnnmu_approach: bool = False
+            # planner done, robots still driving to the last cell
+            self._igbnnmu_finishing: bool = False
+            # pygame ms stamp of completion; drives the overlay clear
+            self._igbnnmu_done_tick: Optional[int] = None
+            # how many ticks a participant was held for another
+            self._igbnnmu_waits: int = 0
+            # A* polyline per participant for the spawn leg only
+            self._igbnnmu_approach_path: Dict[int, List[Waypoint]] = {}
+            self._igbnnmu_approach_idx: Dict[int, int] = {}
+            # World position of the CELL the planner assigned each
+            # participant.  Kept separately from _nav_goals because a
+            # reroute retargets nav at an intermediate waypoint while the
+            # cell it has to end up on is unchanged.
+            self._igbnnmu_cell_goal: Dict[int, Tuple[float, float]] = {}
+            # A* detour around a team-mate, per participant, plus the
+            # cursor into it and the no-progress counter that triggers one
+            self._igbnnmu_detour_path: Dict[int, List[Waypoint]] = {}
+            self._igbnnmu_detour_idx: Dict[int, int] = {}
+            self._igbnnmu_stuck_frames: Dict[int, int] = {}
+            self._igbnnmu_stuck_poses: Dict[int, Tuple[float, float]] = {}
+            self._igbnnmu_reroutes: int = 0
+            # ...of which were triggered by a robot being STUCK,
+            # as opposed to a routine minigraph relocation
+            self._igbnnmu_stuck_reroutes: int = 0
+            # Cells the planner's last step assigned, recorded when the
+            # FINISHING phase begins so arrival is checked against them
+            # rather than against nav goals that get popped on arrival.
+            self._igbnnmu_final_goals: Dict[int, Tuple[float, float]] = {}
+            # Frames since the last planner.step().  Reset whenever a
+            # participant is still en route, so the throttle counts only
+            # frames in which the whole team is actually in position.
+            self._igbnnmu_frame_counter: int = 0
+            self._igbnnmu_stats: Optional[Dict] = None
+            # RoI raster frame - world position of grid cell (0, 0)'s corner
+            # and the grid dimensions.  Set by _build_igbnnmu_grid.
+            self._igbnnmu_origin: Tuple[float, float] = (0.0, 0.0)
+            self._igbnnmu_grid_shape: Tuple[int, int] = (0, 0)
+
+            # Arrival radius for "this robot has reached its planner cell".
+            self.IGBNNMU_ARRIVAL_TOL_M: float = 0.18
+            # One planner cell per DOCKING radius, not per footprint.
+            #
+            # The footprint pitch (2*ROBOT_SIZE_M = 0.70 m) is the natural
+            # reading of "size the grid by what the robot sweeps", and it
+            # is what this used to be.  It does not survive contact with
+            # solid bodies.  Robots are 0.70 m squares, so on a 0.70 m
+            # lattice two of them on adjacent cells are exactly touching
+            # with zero clearance -- and a robot cutting DIAGONALLY past a
+            # cardinal neighbour passes it at pitch/sqrt(2) = 0.495 m,
+            # which is 0.205 m of straight-up interpenetration.  About 29%
+            # of the planner's moves are diagonal, so on a footprint pitch
+            # roughly a third of every run is geometrically impossible.
+            # Serialising those crossings works but costs 3.6x the run
+            # time and jams outright when five robots share one 5x5
+            # minigraph and there is nowhere to yield to.
+            #
+            # For a diagonal to clear a cardinal neighbour you need
+            # pitch/sqrt(2) >= 2*ROBOT_SIZE_M, i.e. pitch >= 0.99 m --
+            # which is exactly DOCKED_DISTANCE_M, the distance the rest of
+            # the sim already treats as "as close as two robots get".  At
+            # that pitch adjacent cells clear by 0.29 m and a diagonal
+            # transit grazes at exactly zero.  Nothing has to wait, nothing
+            # overlaps, and the sweep stays straight.
+            #
+            # The cost is a coarser grid -- a 6x6 m area is 36 cells rather
+            # than 64.  Ash's call, made explicitly against that
+            # trade-off.
+            self.IGBNNMU_CELL_M: float = DOCKED_DISTANCE_M
+            # Spawn-leg A* raster.  The same numbers GBNNBasePlanner uses
+            # for its own approach path (approach_cell_size /
+            # approach_inflate), so Mode 3's spawn leg is routed on exactly
+            # the footing Mode 1's is -- see _igbnnmu_plan_approach.
+            self.IGBNNMU_APPROACH_CELL_M: float = 0.20
+            self.IGBNNMU_APPROACH_INFLATE_M: float = 0.40
+            # Participants separate on their POLYGON footprint, not the
+            # radial one.  The rest of the sim models a robot as a circle
+            # of radius ROBOT_OCCUPANCY_M (= ROBOT_SIZE_M*sqrt(2), the
+            # CIRCUMSCRIBED circle), so two robots are "in contact" at
+            # DOCKED_DISTANCE_M = 0.99 m.  But the robot is a 0.70 m
+            # SQUARE and the coverage grid is pitched at exactly that,
+            # so two robots on adjacent cells sit 0.70 m apart -- inside
+            # the circle model by 0.29 m while their actual bodies are
+            # merely touching.  Reconciling that with a numeric floor was
+            # always going to be wrong in one direction or the other: too
+            # large and the resolver fights the nav controller on every
+            # adjacent pair, too small and robots visibly interpenetrate.
+            # A square-vs-square SAT test has no such knob -- adjacent
+            # cells give exactly zero penetration and any real overlap is
+            # resolved along the minimum translation vector.  See
+            # _obb_overlap.
+            self.IGBNNMU_POLY_HALF_M: float = ROBOT_SIZE_M
+            # Penetration below this is tangential contact, not a
+            # collision: a diagonal move grazes a cardinal neighbour
+            # at exactly zero clearance on this pitch.
+            self.IGBNNMU_GRAZE_TOL_M: float = 0.02
+            # How deep a footprint overlap has to be before the waypoint
+            # wait treats another participant as "in the way".
+            #
+            # This has to sit ABOVE adjacency jitter.  A robot may settle
+            # up to IGBNNMU_ARRIVAL_TOL_M off its cell centre, and a
+            # diagonal move grazes a cardinal neighbour at exactly zero
+            # clearance on this pitch, so two robots that are merely
+            # passing normally can read ~0.2 m of momentary overlap.
+            # Below 0.25 the wait fires on that, robots hold for each
+            # other constantly, and the run deadlocks -- measured at 0.10,
+            # 0.15 and 0.20 alike: 23 stall recoveries, 3400 ticks, and
+            # robots ending 4.6 m from their final cells, against 1 stall,
+            # 952 ticks and every robot arriving at 0.25.
+            self.IGBNNMU_WAIT_BITE_M: float = 0.25
+            # Advance the planner once every N frames once the team is in
+            # position - 12 frames at 30 FPS is ~0.4 s per cell, slow enough
+            # to read the sweep and the minigraph hand-offs.
+            self.IGBNNMU_FRAMES_PER_STEP: int = 12
+            # No progress toward its cell for this many frames and a
+            # participant gets an A* reroute around whatever is in the
+            # way.  1 s at 30 FPS -- long enough that a robot merely
+            # waiting its turn at a crossing is not rerouted, short
+            # enough to act well before the 3 s stall guard, whose
+            # escape is cruder (it steps the planner without the
+            # robots).
+            self.IGBNNMU_REROUTE_FRAME_LIMIT: int = 30
+            # Standardised sweep heading.  Forward is (cos yaw, sin yaw)
+            # and +y is up on screen, so north is +pi/2.  Robots spawn at
+            # yaw 0, i.e. facing east.
+            self.IGBNNMU_NORTH_YAW: float = math.pi / 2.0
+            # Stall recovery, mirroring Mode 5's AP-approach guard: when no
+            # participant has moved more than IGBNNMU_STALL_MOVE_TOL_M for
+            # IGBNNMU_STALL_FRAME_LIMIT consecutive frames, the driver stops
+            # waiting for arrivals and steps the planner from wherever the
+            # robots actually are.  Without it a single wedged robot freezes
+            # the entire sweep, because the step throttle only counts frames
+            # in which the whole team is in position.
+            self.IGBNNMU_STALL_MOVE_TOL_M: float = 0.02   # < 2 cm/frame
+            self.IGBNNMU_STALL_FRAME_LIMIT: int = 90      # 3 s at 30 FPS
+            # The same guard during FINISHING, where the planner is
+            # already done and there is no schedule left to protect.
+            self.IGBNNMU_FINISH_FRAME_LIMIT: int = 900    # 30 s
+            # Hold the finished overlay this long, then clear it.
+            # Same beat as Mode 5's GBNNH_RESET_AFTER_MS.
+            self.IGBNNMU_CLEAR_AFTER_MS: int = 1000
+            self._igbnnmu_stall_count: int = 0
+            self._igbnnmu_stall_poses: Dict[int, Tuple[float, float]] = {}
+            self._igbnnmu_stalls: int = 0
+            self._igbnnmu_summary: str = ""
+
+            # Reusable adapter instances (also let the planner adapters hot-swap)
             self._default_planner: Planner = DefaultPlanner()
             self._gbnn_planner:    Planner = GBNNBasePlanner(
                 footprint_m=2 * ROBOT_SIZE_M)
 
             # Phase-A scaffolds: registry + reconfig sequencer.  Both are
             # idle in mode 1 (no mode switching, no reconfig events),
-            # and exist so Phases B–E can plug in with zero changes here.
+            # and exist so the planner adapters can plug in with zero changes here.
             self.registry = PlannerRegistry()
             self.registry.register("default", self._default_planner)
             self.registry.register("gbnn",    self._gbnn_planner)
 
-            # Phase B: Interstar adapter.  Not on its own keybind — dispatched
+            # Inter-Star: adapter.  Not on its own keybind — dispatched
             # automatically based on selection state (see _on_mouseup).
             self._interstar_planner = InterstarPlanner(
                 cell_size      = 0.20,
@@ -2185,7 +2394,7 @@ def _run_pygame_teleop() -> int:
                 self._mouse_held = True
                 return
 
-            # Phase B: Ctrl+LMB on a robot → toggle in multi-select set.
+            # Inter-Star: Ctrl+LMB on a robot → toggle in multi-select set.
             #
             # Rules:
             #   * Clicking a robot already in `_selected_ids` removes it.
@@ -2355,7 +2564,21 @@ def _run_pygame_teleop() -> int:
                     dxp = sx - start[0]
                     dyp = sy - start[1]
                     if math.hypot(dxp, dyp) > self.GBNN_DRAG_THRESHOLD_PX:
-                        self._dispatch_gbnn_coverage(start, (sx, sy))
+                        # PHASE C: auto-dispatch on selection state, the
+                        # same rule Inter-Star uses for clicks.
+                        #
+                        #   robots in _selected_ids  -> IGBNN-mu coverage
+                        #   nothing selected         -> mode-1 GBNN coverage
+                        #
+                        # Ctrl+click robots to build the selection, then
+                        # drag the area -- mirroring "select robots, then
+                        # click points" for Inter-Star.  A tap still falls
+                        # through to Inter-Star's click dispatch below, so
+                        # drag and tap stay cleanly separated.
+                        if self._selected_ids:
+                            self._dispatch_igbnnmu_coverage(start, (sx, sy))
+                        else:
+                            self._dispatch_gbnn_coverage(start, (sx, sy))
                         gbnn_dispatched = True
                         self._mouse_down_pos = None
 
@@ -2521,7 +2744,7 @@ def _run_pygame_teleop() -> int:
             self._mouse_down_pos = None
 
         def _on_mousemotion(self, event) -> None:
-            # Phase A: track drag for GBNN-coverage rectangle preview
+            # Mode 1: track drag for GBNN-coverage rectangle preview
             if self._gbnn_drag_armed:
                 self._gbnn_drag_last = event.pos
 
@@ -2663,28 +2886,41 @@ def _run_pygame_teleop() -> int:
                     HUD_ACCENT)
                 return
             if key == pygame.K_x:
-                # Cancel navigation for selected robot's formation
+                # Cancel EVERY planner driving the selected robot's
+                # formation, not just its current nav goal.  Cancelling
+                # the goal alone left the planner running, and it re-
+                # issued the goal on the next tick.
                 sel = self.selected_id
                 host = self._host_of(sel) if sel in self.bus.configurers else sel
-                self._cancel_nav(host, f"Robot{host} navigation cancelled.")
+                modes = self._cancel_all_for(host)
+                self._set_message(
+                    f"Robot{host}: cancelled " + ", ".join(modes)
+                    if modes else f"Robot{host}: nothing to cancel.",
+                    HUD_ACCENT if modes else HUD_WARN)
                 return
             if key == pygame.K_t:
                 self._try_trolley_toggle()
                 return
-            # Phase E (Mode 5) — MDA mount/unmount on key '0'
+            # Mode 5 — MDA mount/unmount on key '0'
             if key == pygame.K_0:
                 self._try_mda_mount_toggle()
                 return
-            # Phase E (Mode 5) — surface-view subpanel toggle on Tab
+            # Mode 5 — surface-view subpanel toggle on Tab
             if key == pygame.K_TAB:
                 self._gbnnh_show_panel = not self._gbnnh_show_panel
                 self._set_message(
                     f"Surface view: {'ON' if self._gbnnh_show_panel else 'OFF'}",
                     HUD_ACCENT)
                 return
-            # Phase E (Mode 5) — Enter starts the cleaning sequence
+            # Mode 5 — Enter starts the cleaning sequence
             if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if self._start_gbnnh_run():
+                    return
+                # Mode 3 - Enter also starts an armed IGBNN-mu run.
+                # Ordered after Mode 5 so the existing binding keeps priority;
+                # _start_igbnnmu_run() returns False when nothing is armed, so
+                # the key still falls through when neither mode wants it.
+                if self._start_igbnnmu_run():
                     return
             if key == pygame.K_c:
                 # Clear all obstacles
@@ -2694,10 +2930,15 @@ def _run_pygame_teleop() -> int:
                 self._set_message("All obstacles cleared.", HUD_WARN)
                 return
             if key == pygame.K_ESCAPE:
-                # Phase B: Esc first cancels Interstar selection / fission
-                # queue / active plan + render state.  A second Esc (or
-                # when nothing is active) quits the sandbox.
+                # Esc cancels the current selection, the fission queue and
+                # any active plan (including Inter-Star render state).  It
+                # never quits the sandbox — close the window for that.
                 dirty = False
+                # Mode 3 - Esc clears an armed or running IGBNN-mu
+                # sweep first, same as it clears Mode 2 / Mode 5 state.
+                if self._igbnnmu_planner is not None:
+                    self._cancel_igbnnmu()
+                    dirty = True
                 if self._selected_ids:
                     self._selected_ids.clear()
                     dirty = True
@@ -2742,7 +2983,7 @@ def _run_pygame_teleop() -> int:
                     self._interstar_selected_cache = []
                     self._interstar_replan_counter = 0
                     dirty = True
-                # Phase E (Mode 5) cleanup — mirrors the Inter-Star block
+                # Mode 5 cleanup — mirrors the Inter-Star block
                 # above so a single Esc tear-down covers all active modes.
                 if (self._gbnnh_active
                         or self._gbnnh_aps
@@ -2764,9 +3005,11 @@ def _run_pygame_teleop() -> int:
                     dirty = True
                 if dirty:
                     self._set_message(
-                        "Esc: Interstar / GBNN+H state cleared.", HUD_ACCENT)
-                    return
-                self.running = False
+                        "Esc: selection and active plans cleared.", HUD_ACCENT)
+                else:
+                    self._set_message(
+                        "Esc: nothing active to clear. "
+                        "Close the window to quit.", HUD_WARN)
                 return
 
         def _sync_keyboard_state(self) -> None:
@@ -3445,7 +3688,7 @@ def _run_pygame_teleop() -> int:
                 f"(uid={best_obs.uid})...", HUD_OK)
 
         # ================================================================
-        # Phase E (Mode 5) — MDA mount + AP placement + visibility
+        # Mode 5 — MDA mount + AP placement + visibility
         # ================================================================
 
         def _try_mda_mount_toggle(self) -> None:
@@ -3875,7 +4118,7 @@ def _run_pygame_teleop() -> int:
         def _surface_length_cells(kind: "ObstacleKind") -> int:
             """Map obstacle kind → grid-rows in the merged RoI.  Walls have
             a tall surface (14 cells), tables 5, chairs 3 — per the
-            user's spec for Phase E rule 3."""
+            user's spec for GBNN+H rule 3."""
             table = {
                 ObstacleKind.WALL:          14,
                 ObstacleKind.PILLAR:        14,
@@ -4718,7 +4961,7 @@ def _run_pygame_teleop() -> int:
             Each segment is drawn as a thick polyline along the obstacle
             edge that produced it; the swept (cleaned) portion shows in
             green, the remaining portion in amber.  This makes the
-            "lines in plan view" geometry visible exactly as Phase E §3
+            "lines in plan view" geometry visible exactly as GBNN+H §3
             specifies — and disjoint segments stay disjoint.
             """
             ap_pose = ap["pose"]
@@ -4784,7 +5027,7 @@ def _run_pygame_teleop() -> int:
         def _draw_gbnnh_surface_panel(self) -> None:
             """Surface-view subpanel — GBNN+H 2D grid for the active segment.
 
-            Restored from the pre-v3 grid view.  Each Phase E run
+            Restored from the pre-v3 grid view.  Each GBNN+H run
             instantiates a fresh GBNN+H planner per RoI segment; this
             panel shows the live state of THAT planner: cells (dirty /
             visited / obstacle), two coloured EE markers, per-EE
@@ -5307,6 +5550,28 @@ def _run_pygame_teleop() -> int:
             if self._dragging_robot is not None:
                 drag_fid = fmap.get(self._dragging_robot)
 
+            # Mode 3 exemption set: every robot in every participating
+            # formation, for as long as a Mode 3 run owns them.
+            #
+            # "Owns them" outlasts the run itself by the overlay hold.  A
+            # completed sweep leaves the team standing one pitch apart on
+            # the covered lattice, which is inside DOCKED_DISTANCE_M, so
+            # the tick the relaxation lifted the whole formation used to
+            # spring apart -- robots visibly sliding off the final cells
+            # they had just been driven onto (measured 0.10-0.14 m within
+            # five ticks of completion).  Holding it until the overlay
+            # clears keeps the finished picture on the cells the planner
+            # actually assigned.  After that the ordinary separation rule
+            # resumes and the team relaxes to the docking radius, which is
+            # correct -- the coverage lattice is a planning construct, not
+            # a docked formation.
+            igbnnmu_pair: Optional[set] = None
+            if self._igbnnmu_hosts and (self._igbnnmu_active
+                                        or self._igbnnmu_done_tick is not None):
+                igbnnmu_pair = set()
+                for _h in self._igbnnmu_hosts:
+                    igbnnmu_pair.update(self._members_of(_h))
+
             # Docking exemption: any trigger member <-> dock_target
             exempt_target: Optional[int] = None
             exempt_members: Optional[set] = None
@@ -5365,18 +5630,65 @@ def _run_pygame_teleop() -> int:
                         if (ri == exempt_target and rj in exempt_members) or \
                            (rj == exempt_target and ri in exempt_members):
                             continue
+                    # Mode 3: participants separate on their POLYGON
+                    # footprint, everyone else on the radial one.
+                    #
+                    # The rest of the sim treats a robot as a circle of
+                    # radius ROBOT_OCCUPANCY_M -- the circumscribed
+                    # circle -- so contact is DOCKED_DISTANCE_M, 0.99 m.
+                    # The coverage grid is pitched at one robot footprint
+                    # (2*ROBOT_SIZE_M = 0.70 m) because that is what the
+                    # robot actually sweeps, so two participants on
+                    # cardinally adjacent cells sit 0.70 m apart: their
+                    # square bodies are exactly touching, while the
+                    # circle model reads 0.29 m of penetration and shoves
+                    # them off the line nav is driving.
+                    #
+                    # A numeric floor cannot fix that -- too large and the
+                    # resolver fights nav on every adjacent pair, too
+                    # small and robots visibly interpenetrate, which is
+                    # what a half-pitch floor did.  Square-vs-square SAT
+                    # has no such knob: adjacent cells give exactly zero
+                    # penetration, a diagonal transit clears properly, and
+                    # a genuine overlap is resolved along the minimum
+                    # translation vector.  Only pairs where BOTH sides are
+                    # participants use it; every other interaction --
+                    # non-participants, obstacles, humans, trolleys --
+                    # keeps the radial model untouched.
+                    poly_pair = (igbnnmu_pair is not None
+                                 and ri in igbnnmu_pair
+                                 and rj in igbnnmu_pair)
                     pi = self.bus.poses[ri]
                     pj = self.bus.poses[rj]
-                    dx = pi.x - pj.x
-                    dy = pi.y - pj.y
-                    d  = math.hypot(dx, dy)
-                    if d < DOCKED_DISTANCE_M:
-                        overlap = DOCKED_DISTANCE_M - d
+                    if poly_pair:
+                        mtv = _obb_overlap(
+                            pi.x, pi.y, pi.yaw, pj.x, pj.y, pj.yaw,
+                            self.IGBNNMU_POLY_HALF_M)
+                        # A diagonal move on this lattice passes a cardinal
+                        # neighbour at EXACTLY zero clearance -- that is
+                        # what setting the pitch to DOCKED_DISTANCE_M buys.
+                        # Tangency plus a millimetre of numerical jitter
+                        # would otherwise read as a collision on every
+                        # diagonal, so grazes below the contact tolerance
+                        # are ignored, exactly as COLLISION_EPSILON does
+                        # for the radial path.
+                        hit = (mtv is not None
+                               and mtv[2] > self.IGBNNMU_GRAZE_TOL_M)
+                        if hit:
+                            ux, uy, overlap = mtv
+                    else:
+                        dx = pi.x - pj.x
+                        dy = pi.y - pj.y
+                        d  = math.hypot(dx, dy)
+                        hit = d < DOCKED_DISTANCE_M
+                        if hit:
+                            overlap = DOCKED_DISTANCE_M - d
+                            if d < 1e-6:
+                                dx, dy, d = 1.0, 0.0, 1.0
+                            ux, uy = dx / d, dy / d
+                    if hit:
                         if overlap < COLLISION_EPSILON:
                             continue
-                        if d < 1e-6:
-                            dx, dy, d = 1.0, 0.0, 1.0
-                        ux, uy  = dx / d, dy / d
 
                         # Velocity-weighted split (replaces former size
                         # weighting).  Each formation's per-tick motion
@@ -5563,7 +5875,7 @@ def _run_pygame_teleop() -> int:
                                 if (att_rid is not None
                                         and self._attached_trolley.get(att_rid) == obs.uid):
                                     continue
-                            # Phase E: a mounted MDA module is "part of" its
+                            # GBNN+H: a mounted MDA module is "part of" its
                             # host robot — it shares the host's pose every
                             # tick and would otherwise force-push the host
                             # away from itself the moment it's mounted.
@@ -5644,7 +5956,7 @@ def _run_pygame_teleop() -> int:
                             continue
                         if obs.uid == self.obs_mgr.dragging_id:
                             continue
-                        # Phase E: a mounted MDA is part of its host robot,
+                        # GBNN+H: a mounted MDA is part of its host robot,
                         # not a free-standing wall.  Skip so humans aren't
                         # blocked by a robot's "ghost" attachment.
                         if obs.is_mounted:
@@ -5975,7 +6287,7 @@ def _run_pygame_teleop() -> int:
             # singleton uses its own pose; a fused singleton uses the
             # formation centroid.
             #
-            # Phase E (Mode 5) override: when navigating to an MDA
+            # Mode 5 override: when navigating to an MDA
             # access point, the reference point is the MDA's pose
             # (== the host robot's pose, since the MDA is mounted on
             # the host).  Using the MDA pose for arrival makes the
@@ -6182,7 +6494,29 @@ def _run_pygame_teleop() -> int:
                 and host in self._interstar_paths
             )
             gbnn_driven = host in self._gbnn_planner_for
-            # Phase E (Mode 5): the MDA-host is en route to an access
+            # Mode 3.  A Mode 3 participant is on one of exactly two
+            # kinds of leg, and they want opposite things:
+            #
+            #   LATTICE HOP -- cell to adjacent cell.  Pure translation
+            #     with the body held facing up, identical to GBNN above.
+            #     Ash: "IGBNN waypoint to waypoint -> face upwards upon
+            #     reaching goal."
+            #   A* LEG -- the initial move to the starting point, a
+            #     minigraph-to-minigraph relocation, or a reroute round a
+            #     blockage.  These follow the motion profile the user has
+            #     SET (M key: differential / holonomic / hybrid) with yaw
+            #     following the direction of travel, exactly as ordinary
+            #     A* nav does.  Ash: "abide set motion profile."
+            #
+            # A robot on an A* leg is identified by having a detour path
+            # or being in the approach phase; everything else is a hop.
+            igbnnmu_lattice = (
+                self._igbnnmu_active
+                and host in self._igbnnmu_hosts
+                and not self._igbnnmu_approach
+                and host not in self._igbnnmu_detour_path
+            )
+            # Mode 5: the MDA-host is en route to an access
             # point — flag is True only during the en-route leg
             # (planner not yet built; once the per-AP GBNN+H planner
             # is instantiated the nav goal has been popped and this
@@ -6195,7 +6529,7 @@ def _run_pygame_teleop() -> int:
                 and 0 <= self._gbnnh_active_ap_idx < len(self._gbnnh_aps)
             )
 
-            if gbnn_driven:
+            if gbnn_driven or igbnnmu_lattice:
                 motion_mode = "holonomic"
                 target_yaw  = math.pi / 2.0   # grid-up / world +y
             elif interstar_driven:
@@ -6239,7 +6573,7 @@ def _run_pygame_teleop() -> int:
                 # Default pure-holonomic: no rotation.  GBNN override
                 # adds a P-controller on yaw toward grid-up.
                 wz = 0.0
-                if gbnn_driven:
+                if gbnn_driven or igbnnmu_lattice:
                     yaw_err = target_yaw - hp.yaw
                     yaw_err = (yaw_err + math.pi) % (2 * math.pi) - math.pi
                     wz = max(-BASE_ANG_SPEED * self.vel_scale,
@@ -6467,6 +6801,82 @@ def _run_pygame_teleop() -> int:
                     return True
             return False
 
+        def _draw_robot_ground(self, rid: int) -> None:
+            """Layer 1 -- the docking ring and the occupancy disk.
+
+            Split out of _draw_robot so that EVERY robot's footprint is
+            painted before ANY robot's body.  Drawn in one pass per robot,
+            the filled occupancy disk of a robot later in the loop covered
+            the body of a robot earlier in it, so two robots standing
+            close together had one of them buried under the other's
+            footprint.  Footprints are ground markings; nothing that
+            belongs to a robot should ever occlude another robot.
+            """
+            pose = self.bus.poses[rid]
+            cx, cy = self._world_to_screen(pose.x, pose.y)
+            half_px = max(8, self._metres_to_px(ROBOT_VISUAL_HALF_M))
+
+            under_trolley = self._robot_under_caster_trolley(rid)
+            if under_trolley:
+                extent = max(half_px + 30,
+                             self._metres_to_px(DOCKING_DISTANCE_M / 2.0) + 4)
+                temp_surf = pygame.Surface((extent * 2, extent * 2),
+                                           pygame.SRCALPHA)
+                ox, oy = extent, extent
+            else:
+                temp_surf = None
+                ox, oy = cx, cy
+            target = temp_surf if temp_surf is not None else self.screen
+
+            # Pale blue docking-radius ring.
+            dock_radius_px = self._metres_to_px(DOCKING_DISTANCE_M / 2.0)
+            ring_col = DOCK_RING
+            if self.docking is not None and rid in (
+                    self.docking["trigger_host"],
+                    self.docking["dock_target"]):
+                ring_col = DOCK_ACTIVE_RING
+            if dock_radius_px > 2:
+                pygame.draw.circle(target, ring_col,
+                                   (ox, oy), dock_radius_px, width=1)
+
+            # Occupancy disk (the collision region).
+            occ_px = self._metres_to_px(ROBOT_OCCUPANCY_M)
+            pygame.draw.circle(target, (55, 55, 70), (ox, oy), occ_px, width=0)
+
+            if temp_surf is not None:
+                temp_surf.set_alpha(100)
+                self.screen.blit(temp_surf, (cx - ox, cy - oy))
+
+        def _draw_robot_label(self, rid: int) -> None:
+            """Layer 3 -- the Inter-Star candidate star and the name label.
+
+            Also split out of _draw_robot, for the same reason: drawn in
+            the per-robot pass, a neighbouring robot's body painted over
+            them.  Annotations belong above every robot.
+            """
+            pose = self.bus.poses[rid]
+            cx, cy = self._world_to_screen(pose.x, pose.y)
+            half_px = max(8, self._metres_to_px(ROBOT_VISUAL_HALF_M))
+            c, s = math.cos(pose.yaw), math.sin(pose.yaw)
+
+            if self._is_interstar_candidate(rid):
+                rx = c * half_px - s * (-half_px)
+                ry = s * half_px + c * (-half_px)
+                outer_r = max(7, half_px // 2)
+                self._draw_star(
+                    self.screen, cx + rx, cy - ry,
+                    outer_r, max(3, int(outer_r * 0.42)),
+                    fill=(255, 225, 90), outline=(20, 20, 25),
+                )
+
+            host_rid = self._host_of(rid)
+            role = "H" if rid == host_rid else "M"
+            n    = len(self._members_of(rid))
+            lbl  = f"Robot{rid}  {role}  n={n}  host=Robot{host_rid}"
+            surf = self.font_small.render(lbl, True, (240, 240, 240))
+            self.screen.blit(surf,
+                             (cx - surf.get_width() // 2, cy - half_px - 22))
+
         def _draw_robot(self, rid: int) -> None:
             cfg  = self.bus.configurers[rid]
             pose = self.bus.poses[rid]
@@ -6499,21 +6909,9 @@ def _run_pygame_teleop() -> int:
 
             target = temp_surf if temp_surf is not None else self.screen
 
-            # 1. Pale blue docking-radius ring (beneath everything)
-            dock_radius_px = self._metres_to_px(DOCKING_DISTANCE_M / 2.0)
-            ring_col = DOCK_RING
-            if self.docking is not None and rid in (
-                    self.docking["trigger_host"],
-                    self.docking["dock_target"]):
-                ring_col = DOCK_ACTIVE_RING
-            if dock_radius_px > 2:
-                pygame.draw.circle(target, ring_col,
-                                   (ox, oy), dock_radius_px, width=1)
-
-            # 2. Occupancy outline (filled subtle disk = collision region)
-            occ_px = self._metres_to_px(ROBOT_OCCUPANCY_M)
-            pygame.draw.circle(target, (55, 55, 70),
-                               (ox, oy), occ_px, width=0)
+            # 1-2. Docking ring and occupancy disk are drawn earlier, by
+            # _draw_robot_ground, so that no robot's footprint can land on
+            # top of another robot's body.
 
             # 3. Selection ring (single-robot active teleoperation target).
             # Note: Multi-robot Inter-Star candidates are indicated by a
@@ -6575,31 +6973,8 @@ def _run_pygame_teleop() -> int:
             #   * still pending in the post-plan proximity-chain fusion queue.
             # When Inter-Star terminates and the fusion queue drains, all
             # three sources become empty and the star disappears.
-            if self._is_interstar_candidate(rid):
-                # Top-right body corner in absolute screen coords
-                trx_local, try_local = half_px, half_px
-                rx =  c * trx_local - s * (-try_local)
-                ry =  s * trx_local + c * (-try_local)
-                star_cx = cx + rx
-                star_cy = cy - ry
-                outer_r = max(7, half_px // 2)
-                inner_r = max(3, int(outer_r * 0.42))
-                self._draw_star(
-                    self.screen,
-                    star_cx, star_cy,
-                    outer_r, inner_r,
-                    fill=(255, 225, 90),
-                    outline=(20, 20, 25),
-                )
-
-            # 7. Label above body (always opaque for readability)
-            host_rid = self._host_of(rid)
-            role = "H" if rid == host_rid else "M"
-            n    = len(self._members_of(rid))
-            lbl  = f"Robot{rid}  {role}  n={n}  host=Robot{host_rid}"
-            surf = self.font_small.render(lbl, True, (240, 240, 240))
-            lbl_pos = (cx - surf.get_width() // 2, cy - half_px - 22)
-            self.screen.blit(surf, lbl_pos)
+            # 6-7. The Inter-Star candidate star and the name label are
+            # drawn later, by _draw_robot_label, above every robot.
 
         def _is_interstar_candidate(self, rid: int) -> bool:
             """True if `rid` should show the yellow Inter-Star candidate
@@ -6764,20 +7139,20 @@ def _run_pygame_teleop() -> int:
                     rid = next(iter(self._nav_goals))
                     gx, gy = self._nav_goals[rid]
                     nav_tag = f"  Robot{rid} NAV→({gx:.1f},{gy:.1f})"
-            # Phase B: Interstar metric line — expansions vs A* baseline
+            # Inter-Star: metric line — expansions vs A* baseline
             interstar_tag = ""
             if self._interstar_metrics:
                 exp = int(self._interstar_metrics.get("expansions", 0))
                 ratio = self._interstar_metrics.get("expansions_ratio", 1.0)
                 interstar_tag = f"  Interstar: {exp} exp ({ratio:.2f}× A*)"
-            # Phase B: multi-select count + pending fission queue
+            # Inter-Star: multi-select count + pending fission queue
             sel_tag = ""
             if self._selected_ids:
                 sel_tag = f"  [selected: {len(self._selected_ids)}]"
             if self._fission_host is not None and self._fission_goals_pending:
                 sel_tag += (f"  [fission goals: "
                             f"{len(self._fission_goals_pending)}]")
-            # Phase E: GBNN+H mode tag
+            # GBNN+H: GBNN+H mode tag
             gbnnh_tag = ""
             if self._gbnnh_active and self._gbnnh_active_ap_idx is not None:
                 idx = self._gbnnh_active_ap_idx
@@ -6853,7 +7228,7 @@ def _run_pygame_teleop() -> int:
             self.screen.blit(line4, (12, 76))
 
             help_left  = ("1-5 select   SHIFT+N dock   SPACE fission   "
-                          "Z rot   P algo   M motion   X nav   C clear")
+                          "Z rot   P algo   M motion   X cancel   C clear")
             help_right = ("W/A/S/D diff   I/J/K/L holo   Q↑ E↓ speed   "
                           "Click: spawn/goal   Dbl-click: despawn")
             s1 = self.font_small.render(help_left,  True, (160, 160, 180))
@@ -7181,6 +7556,1261 @@ def _run_pygame_teleop() -> int:
                 f"stepping incrementally (heatmap evolves live)",
                 HUD_OK,
             )
+
+
+        # ====================================================================
+        #  PHASE C - IGBNN-mu multi-robot complete coverage (Mode 3)
+        # ====================================================================
+        #
+        #  Gesture flow, deliberately parallel to Mode 5's AP flow:
+        #
+        #    1. Ctrl+LMB robots to select them, then LMB-drag the area.
+        #       Selection state chooses the planner, exactly as Inter-Star
+        #       chooses between Inter-Star and plain A* for a click:
+        #
+        #           selection non-empty -> IGBNN-mu over the dragged area
+        #           selection empty     -> mode-1 single-robot GBNN
+        #
+        #       Shift+LMB stays Mode 5 (access points).  Ctrl+LMB on a
+        #       *robot* is Mode 2 multi-select and is consumed at
+        #       mousedown, so it never reaches this path.
+        #    2. The minigraph lattice and the RoI border render immediately,
+        #       so the decomposition is visible from the first frame.
+        #    3. The drag starts the run outright -- it drives every
+        #       participant to the entry cells the planner assigned along
+        #       the first minigraph's edge (the APPROACH phase).  There is
+        #       no separate confirm step: Mode 1's drag and Mode 2's click
+        #       both dispatch on the gesture, and Mode 3 has all its input
+        #       from the one drag.
+        #    4. Once all participants have arrived, the driver ticks
+        #       planner.step() in lockstep with real arrivals, throttled to
+        #       one step per IGBNNMU_FRAMES_PER_STEP frames so the sweep is
+        #       readable rather than a blur.
+        #    5. Esc            -> clears all Mode 3 state.
+        #
+        #  Enter is still wired to _start_igbnnmu_run() so a run armed by a
+        #  scripted caller can be started by hand, but the drag gesture
+        #  never leaves one waiting.
+        #
+        #  Scope note: this is the *kinematic* integration.  Robots follow the
+        #  waypoints IGBNN-mu produces, and the planner's fused groups (S_v /
+        #  S_h) are drawn as links between members, but no Configurer FSM
+        #  fuse/fission is issued.  Physical reconfiguration is a separate
+        #  increment that will drive _try_fuse / _try_fission from the same
+        #  planner state; nothing here forecloses it.
+
+        def _igbnnmu_participants(self) -> List[int]:
+            """Host ids taking part in a Mode 3 run.
+
+            The Mode 2 multi-selection IS the participant list.  An empty
+            selection is not "use everyone" -- it is the signal to run
+            mode-1 GBNN instead, so the drag never routes here at all.
+
+            One entry per formation - a fused pair contributes its host
+            only, because the formation moves as one planning unit.
+            """
+            hosts = {self._host_of(r) for r in self._selected_ids
+                     if r in self.bus.configurers}
+            return sorted(hosts)
+
+        def _igbnnmu_cell_to_world(self, cell: Tuple[int, int]) -> XY:
+            """Planner cell (row, col) -> world centre of that cell."""
+            r, c = cell
+            ox, oy = self._igbnnmu_origin
+            cs = self.IGBNNMU_CELL_M
+            return (ox + (c + 0.5) * cs, oy + (r + 0.5) * cs)
+
+        def _igbnnmu_world_to_cell(self, wx: float, wy: float) -> Tuple[int, int]:
+            """World point -> planner cell (row, col), clamped into the RoI."""
+            ox, oy = self._igbnnmu_origin
+            cs = self.IGBNNMU_CELL_M
+            rows, cols = self._igbnnmu_grid_shape
+            c = int((wx - ox) / cs)
+            r = int((wy - oy) / cs)
+            return (max(0, min(rows - 1, r)), max(0, min(cols - 1, c)))
+
+        def _build_igbnnmu_grid(self, rect: "Rect",
+                              participants: List[int]) -> "np.ndarray":
+            """Rasterise `rect` into an IGBNN-mu occupancy grid.
+
+            Same under-bite rasterisation as Mode 1 (math.floor, so the grid
+            never spills past the drawn rectangle) and the same geometric
+            blocked-cell test, but every *participating* robot is excluded
+            from the occupancy: they are the ones doing the covering, so
+            treating them as obstacles would pre-block their own cells.
+            Non-participants stay in as dynamic obstacles to route around.
+
+            Returns a (rows, cols) array using the planner's encoding:
+            -1.0 blocked, 1.0 free-and-unvisited.
+            """
+            rect = rect.normalized()
+            cs = self.IGBNNMU_CELL_M
+            cols = max(1, int(math.floor(rect.width / cs)))
+            rows = max(1, int(math.floor(rect.height / cs)))
+            pad_x = (rect.width - cols * cs) / 2.0
+            pad_y = (rect.height - rows * cs) / 2.0
+
+            self._igbnnmu_origin = (rect.x0 + pad_x, rect.y0 + pad_y)
+            self._igbnnmu_grid_shape = (rows, cols)
+
+            part_hosts = set(participants)
+            positions = [
+                (p.x, p.y, ROBOT_SIZE_M)
+                for rid, p in self.bus.poses.items()
+                if self._host_of(rid) not in part_hosts
+            ]
+            obstacles = [obs for obs in self.obs_mgr.obstacles.values()
+                         if not obs.is_mounted]
+
+            helper = self._gbnn_planner            # reuse the tested geometry
+            g = np.ones((rows, cols), dtype=float)
+            for r in range(rows):
+                for c in range(cols):
+                    cx = self._igbnnmu_origin[0] + c * cs
+                    cy = self._igbnnmu_origin[1] + r * cs
+                    if helper._cell_blocked(cx, cy, cs, obstacles, positions):
+                        g[r, c] = -1.0
+            return g
+
+        def _dispatch_igbnnmu_coverage(
+            self,
+            start_screen: Tuple[int, int],
+            end_screen:   Tuple[int, int],
+        ) -> None:
+            """Ctrl+LMB-drag -> arm an IGBNN-mu run over the drawn RoI.
+
+            Arms only.  Nothing moves until Enter, so the minigraph
+            decomposition can be inspected first - which matters, because a
+            bad (RoI size, robot count) pair is far easier to diagnose from
+            the drawn lattice than from robot behaviour.
+            """
+            participants = self._igbnnmu_participants()
+            if not participants:
+                # Unreachable through the drag gesture, which only routes
+                # here when the selection is non-empty; a direct caller
+                # (tests, scripted demos) can still land on it.
+                self._set_message(
+                    "IGBNN-mu: select robots first (Ctrl+click), then drag "
+                    "the area.  With nothing selected, a drag runs mode-1 "
+                    "GBNN instead.", HUD_WARN)
+                return
+
+            w0 = self._screen_to_world(*start_screen)
+            w1 = self._screen_to_world(*end_screen)
+            rect = Rect(w0[0], w0[1], w1[0], w1[1]).normalized()
+
+            n = len(participants)
+            cs = self.IGBNNMU_CELL_M
+            # Rule 2 wants n cells along every entry edge.  The planner will
+            # pad up to satisfy it (Section IV-C), but padding a RoI far
+            # smaller than n cells produces a grid that is almost entirely
+            # padding, so refuse outright below half the required span and
+            # warn between there and the full requirement.
+            need = n * cs
+            if rect.width < need / 2 or rect.height < need / 2:
+                self._set_message(
+                    f"IGBNN-mu RoI too small: {rect.width:.2f}x"
+                    f"{rect.height:.2f} m for {n} robots; Rule 2 wants about "
+                    f"{need:.2f} m on each side.", HUD_WARN)
+                return
+
+            grid = self._build_igbnnmu_grid(rect, participants)
+            rows, cols = grid.shape
+            if int(np.count_nonzero(grid == 1.0)) < n:
+                self._set_message(
+                    f"IGBNN-mu: only "
+                    f"{int(np.count_nonzero(grid == 1.0))} free cell(s) in "
+                    f"the RoI, fewer than the {n} robot(s) selected.",
+                    HUD_WARN)
+                return
+
+            try:
+                planner = IGBNN_mu(
+                    grid,
+                    n_robots  = n,
+                    visualize = False,
+                )
+                planner.verbose = False
+                # Decompose eagerly so the lattice can be drawn, and so a
+                # Rule 1 / Rule 2 failure surfaces now rather than on Enter.
+                planner._decompose()
+            except ValueError as e:
+                self._set_message(f"IGBNN-mu: {e}", HUD_WARN)
+                self._cancel_igbnnmu(quiet=True)
+                return
+
+            self._igbnnmu_planner   = planner
+            self._igbnnmu_roi       = rect
+            self._igbnnmu_hosts     = list(participants)
+            self._igbnnmu_active    = False
+            self._igbnnmu_started   = False
+            self._igbnnmu_approach  = True
+            self._igbnnmu_frame_counter = 0
+
+            h, v = planner._mini_shape
+            pad = ""
+            if (planner.H, planner.V) != (rows, cols):
+                pad = f", padded to {planner.H}x{planner.V}"
+            self._igbnnmu_summary = (
+                f"{rows}x{cols} cells{pad}, "
+                f"{planner._nr}x{planner._nc} minigraphs of {h}x{v}, "
+                f"{n} robot(s)")
+
+            # Start immediately.  Mode 1's drag and Mode 2's click both
+            # dispatch on the gesture itself; only Mode 5 waits for Enter,
+            # and it does so because a run there is a *sequence* of access
+            # points that has to be placed first.  Mode 3 takes its whole
+            # input from one drag, so there is nothing to wait for.
+            self._start_igbnnmu_run()
+
+        def _start_igbnnmu_run(self) -> bool:
+            """Enter -> begin the armed Mode 3 run.  True if it consumed the key.
+
+            Returns False when no run is armed so the Enter handler can fall
+            through to whatever else wants the key (Mode 5 starts its cleaning
+            sequence on the same key).
+            """
+            if self._igbnnmu_planner is None or self._igbnnmu_active:
+                return False
+
+            planner = self._igbnnmu_planner
+            try:
+                planner.reset()
+            except ValueError as e:
+                self._set_message(f"IGBNN-mu: {e}", HUD_WARN)
+                self._cancel_igbnnmu(quiet=True)
+                return True
+
+            self._igbnnmu_active    = True
+            self._igbnnmu_started   = True
+            self._igbnnmu_approach  = True
+            self._igbnnmu_finishing = False
+            self._igbnnmu_done_tick = None
+            self._igbnnmu_waits     = 0
+            self._igbnnmu_done_tick = None
+            self._igbnnmu_waits   = 0
+            self._igbnnmu_approach_path = {}
+            self._igbnnmu_approach_idx  = {}
+            self._igbnnmu_final_goals   = {}
+            self._igbnnmu_cell_goal     = {}
+            self._igbnnmu_detour_path   = {}
+            self._igbnnmu_detour_idx    = {}
+            self._igbnnmu_stuck_frames  = {}
+            self._igbnnmu_stuck_poses   = {}
+            self._igbnnmu_reroutes      = 0
+            self._igbnnmu_stuck_reroutes = 0
+            self._igbnnmu_frame_counter = 0
+            self._igbnnmu_stall_count = 0
+            self._igbnnmu_stall_poses = {}
+            self._igbnnmu_stalls = 0
+
+            # Route every participant to the entry cell the planner assigned
+            # it along the first minigraph's edge.  The spawn leg gets a real
+            # A* path -- see _igbnnmu_plan_approach -- rather than the
+            # straight 2-point polyline the cell-to-cell sweep uses.
+            self._igbnnmu_approach_path = {}
+            self._igbnnmu_approach_idx = {}
+            unrouted = []
+            for i, cell in enumerate(planner.robot_global_positions()):
+                if i >= len(self._igbnnmu_hosts):
+                    break
+                host = self._igbnnmu_hosts[i]
+                goal = self._igbnnmu_cell_to_world(cell)
+                apath = self._igbnnmu_plan_approach(host, goal)
+                if apath is None:
+                    # Either already on the entry cell (the common case --
+                    # Mode 1 skips the approach for the same reason) or no
+                    # route exists.  Only the second is worth a warning.
+                    rc_x, rc_y = self._rotation_centre(host)
+                    if math.hypot(goal[0] - rc_x, goal[1] - rc_y)                             >= self.IGBNNMU_ARRIVAL_TOL_M:
+                        unrouted.append(host)
+                    self._igbnnmu_seek(host, goal)
+                else:
+                    self._igbnnmu_approach_path[host] = apath
+                    self._igbnnmu_approach_idx[host] = 0
+                    self._igbnnmu_walk_approach(host)
+            if unrouted:
+                self._warn_unrouted = unrouted
+
+            summary = getattr(self, "_igbnnmu_summary", "")
+            self._set_message(
+                f"IGBNN-mu running{': ' + summary if summary else ''} — "
+                f"{len(self._igbnnmu_hosts)} robot(s) moving to the entry "
+                f"edge of minigraph 1/{len(planner._order)}.  Esc to cancel.",
+                HUD_OK)
+            return True
+
+        def _igbnnmu_seek(self, host: int, target: XY) -> None:
+            """Point one formation at `target` using the shared nav controller.
+
+            Two-point polyline, replan pinned off - the same contract Mode 1
+            uses so the waypoint-skip logic stays happy and A* does not
+            overwrite the cell-by-cell target with a path of its own.
+            """
+            rc_x, rc_y = self._rotation_centre(host)
+            if (host in self._nav_goals
+                    and self._nav_goals[host] == target):
+                self._nav_replan_tick[host] = 10 ** 9
+                return
+            self._nav_goals[host]       = target
+            self._nav_paths[host]       = [(rc_x, rc_y), target]
+            self._nav_wp_idx[host]      = 0
+            self._nav_fail_count[host]  = 0
+            self._nav_replan_tick[host] = 10 ** 9
+
+        def _apply_igbnnmu_waypoint_wait(
+            self,
+            distribution: Dict[int, Twist],
+        ) -> Dict[int, Twist]:
+            """Hold a participant whose LEG is blocked by another.
+
+            The planner guarantees no two robots are assigned the same
+            CELL, but it reasons in cells while the sim moves continuous
+            bodies, and the coverage pitch is one robot footprint -- so a
+            leg that merely passes a neighbour is already inside the
+            docking radius.  Letting _resolve_collisions arbitrate that
+            shoves both robots off the line nav is driving, which is the
+            sloppy motion Mode 1's single-robot GBNN never shows.
+
+            Checking only the endpoint is not enough.  Two participants
+            crossing head-on along a row have clear endpoints and still
+            drive straight into each other in the middle (measured: R3 and
+            R4 pressed together for eight consecutive ticks, twice in one
+            run, with 27 collision pushes and one leg 1.39x its straight-
+            line length).  So the test is on the whole segment: slide the
+            robot's own SQUARE footprint to the closest point on the leg
+            it is about to drive, and hold if that square would overlap
+            another participant's.  It then waits and afterwards drives
+            its leg in one clean straight shot -- the same
+            serialise-don't-shove mechanism Inter-Star uses for a shared
+            fusion cell (_apply_interstar_waypoint_wait).
+
+            The clearance test is the same _obb_overlap the resolver uses,
+            so the two cannot disagree about what "in the way" means.  A
+            radial threshold here would either hold robots that are
+            merely passing a neighbour cleanly, or let through a pass
+            that the resolver then has to break up.
+
+            Mutual blocking is broken deterministically: when each robot
+            is in the other's way, only the one with the higher host id
+            yields, so exactly one of the pair moves and neither deadlocks.
+            Same-formation members are exempt -- they ride rigidly with
+            their host and must not block it -- and the stall guard is
+            still there as the backstop.
+
+            Outside an active Mode 3 run this is a no-op.
+            """
+            if not self._igbnnmu_active or not self._igbnnmu_hosts:
+                return distribution
+            # Sweep only.  The spawn leg is routed by an A* that
+            # deliberately EXCLUDES the run's own participants from its
+            # occupancy grid -- that exclusion is what removed the kink at
+            # the head of every trail -- so policing those same paths here
+            # is self-contradictory: the planner says "go straight through
+            # where your team-mate is standing" and the wait says "no".
+            # It deadlocked exactly that way (R3 held on an approach
+            # waypoint 0.57 m from parked R2, forever).  During the
+            # approach the polygon resolver is the only authority, and it
+            # is now geometrically correct.  From the sweep on, the
+            # planner guarantees distinct cells and the wait keeps legs
+            # clean.
+            if self._igbnnmu_approach:
+                return distribution
+            half = self.IGBNNMU_POLY_HALF_M
+
+            def _blocked_by(host: int, other: int) -> bool:
+                """True when `other` sits on the leg `host` is driving."""
+                target = self._nav_goals.get(host)
+                if target is None:
+                    return False
+                sx, sy = self._rotation_centre(host)
+                hp = self.bus.poses[host]
+                op = self.bus.poses[other]
+                dx, dy = target[0] - sx, target[1] - sy
+                seg = math.hypot(dx, dy)
+                if seg < 1e-6:
+                    px, py = sx, sy
+                else:
+                    # Project `other` onto the leg.  Ignore anything behind
+                    # the robot -- a neighbour it has driven past is not in
+                    # the way -- and anything abreast of its start, which
+                    # is just the robot it is sitting next to.
+                    u = ((op.x - sx) * dx + (op.y - sy) * dy) / (seg * seg)
+                    if u <= 0.15:
+                        return False
+                    u = min(1.0, u)
+                    px, py = sx + u * dx, sy + u * dy
+                mtv = _obb_overlap(px, py, hp.yaw, op.x, op.y, op.yaw, half)
+                # Grazing contact is not "in the way".  Cells are one
+                # footprint apart, and a robot may settle up to
+                # IGBNNMU_ARRIVAL_TOL_M off centre, so a merely ADJACENT
+                # pair can read a few centimetres of overlap -- holding on
+                # that would stop a robot every time it drove alongside a
+                # team-mate, which on a shared minigraph is constantly.
+                # A genuine crossing penetrates far more deeply (0.20 m
+                # for a diagonal cut past a cardinal neighbour, 0.65 m for
+                # a head-on swap), so require a real bite.
+                return mtv is not None and mtv[2] > self.IGBNNMU_WAIT_BITE_M
+
+            for host in self._igbnnmu_hosts:
+                if host not in distribution or host not in self.bus.poses:
+                    continue
+                for other in self._igbnnmu_hosts:
+                    if other == host or other not in self.bus.poses:
+                        continue
+                    if self._host_of(other) == self._host_of(host):
+                        continue
+                    if not _blocked_by(host, other):
+                        continue
+                    # Mutual block -- lower host id has right of way.
+                    #
+                    # This does not resolve CHAINS (R2 held by R3, R3 by
+                    # R4, no pair mutual), and deliberately so: every
+                    # cleverer rule tried made things worse.  Yielding to
+                    # all with no exemption froze the team outright.
+                    # Releasing on a timer, or a fixpoint that hands the
+                    # lowest id in a jam its right of way, both end with
+                    # the released robot driving into its blocker -- 911
+                    # to 5934 collision pushes and 20 cm of penetration,
+                    # against 611 and 0.1 cm here.  A chain that this
+                    # cannot clear is left to the stall guard, which is
+                    # what it is for.
+                    if _blocked_by(other, host) and host < other:
+                        continue
+                    distribution[host] = Twist()
+                    self._igbnnmu_waits += 1
+                    break
+            return distribution
+
+        def _igbnnmu_plan_approach(
+            self, host: int, goal: XY,
+        ) -> Optional[List[Waypoint]]:
+            """A* route from a participant's current pose to its entry cell.
+
+            The spawn leg is the one part of a run that is NOT a cell-to-cell
+            hop: the robots start wherever the user left them, which can be
+            anywhere on the map with obstacles and other robots in between.
+            Driving it as a 2-point polyline (what the sweep uses) makes the
+            robot push straight at the entry cell and get deflected, which is
+            the visible kink at the start of every trail.
+
+            Built exactly the way Mode 1's spawn leg is built.  GBNNBase-
+            Planner.plan() does not route through DefaultPlanner either: it
+            rasterises its own occupancy grid off world.obs_mgr at
+            approach_cell_size / approach_inflate and calls pathfind_astar
+            directly.  Two details of that recipe matter here and are why a
+            DefaultPlanner query is the wrong tool:
+
+              * `_external_robot_positions` drops the ACTIVE FORMATION from
+                the occupancy grid, so a robot is never asked to route
+                around itself.  Mode 3's equivalent of "the active
+                formation" is the whole participant set -- while a run is
+                live the planner owns their separation and
+                _resolve_collisions exempts them from each other, so they
+                are not obstacles to one another either.  Leaving them in
+                is what produced the kink: five robots spawn in a cluster,
+                each one's A* then has to squeeze around the other four.
+              * Only robots OUTSIDE that set are dynamic obstacles.  Walls,
+                trolleys and humans still come from obs_mgr as usual.
+
+            Returns None when the robot is already on its entry cell (Mode 1
+            likewise skips the approach when the robot starts inside the
+            RoI) or when no route exists; the caller then drives straight and
+            lets the stall guard deal with it.
+            """
+            rc_x, rc_y = self._rotation_centre(host)
+            if math.hypot(goal[0] - rc_x,
+                          goal[1] - rc_y) < self.IGBNNMU_ARRIVAL_TOL_M:
+                return None
+
+            grid = self._igbnnmu_route_grid(host, avoid_crew=False)
+            path = pathfind_astar(grid, (rc_x, rc_y), goal) or []
+            if len(path) < 2:
+                return None
+            return list(path)
+
+        def _igbnnmu_route_grid(self, host: int, avoid_crew: bool):
+            """Occupancy raster for a Mode 3 A* route.
+
+            `avoid_crew` picks which of the two jobs this is doing.
+
+            False -- the SPAWN leg.  The run's own participants are left
+            out, exactly as GBNNBasePlanner leaves out the active
+            formation, so a robot is never asked to squeeze past the team
+            it is part of.  That exclusion is what removed the kink at the
+            head of every trail.
+
+            True -- a REROUTE.  Here the team-mates are precisely the
+            problem: the robot is stuck because one of them is sitting on
+            the straight line to its cell, so they have to be in the grid
+            for A* to find a way round.  The host's own formation is still
+            excluded -- a formation cannot be an obstacle to itself.
+            """
+            world = self._build_world_spec_for_planners()
+            if avoid_crew:
+                skip = {self._host_of(host)}
+            else:
+                skip = {self._host_of(h) for h in self._igbnnmu_hosts}
+                skip.add(self._host_of(host))
+            positions = [(r.pose.x, r.pose.y, r.footprint_m / 2)
+                         for r in world.robots if r.host_id not in skip]
+            return world.obs_mgr.build_occupancy_grid(
+                world_bounds=world.bounds,
+                cell_size=self.IGBNNMU_APPROACH_CELL_M,
+                inflate_radius=self.IGBNNMU_APPROACH_INFLATE_M,
+                robot_positions=positions, exclude_rid=None,
+            )
+
+        def _igbnnmu_service_detours(self) -> None:
+            """Reroute any participant that cannot reach its cell.
+
+            The sweep drives a straight 2-point polyline to each cell with
+            the nav replan pinned off, which is what keeps the legs clean.
+            The cost of pinning it is that nav will never route around
+            anything: a robot whose line is blocked by a team-mate simply
+            pushes into it until the waypoint wait or the stall guard
+            intervenes, and if the blockage does not clear it never
+            arrives.
+
+            So: when a participant has made no progress toward its cell
+            for IGBNNMU_REROUTE_FRAME_LIMIT frames, plan an A* path to the
+            SAME cell on a grid that does include the other participants,
+            and walk that instead.  The planner's cell assignment is never
+            touched -- only the route taken to reach it -- so this cannot
+            desynchronise the planner from the robots the way the stall
+            guard's escape does.
+
+            A detour is dropped as soon as it is exhausted, and the whole
+            set is cleared whenever the planner issues new cells.
+            """
+            for host in self._igbnnmu_hosts:
+                if host not in self.bus.poses:
+                    continue
+                cell = self._igbnnmu_cell_goal.get(host)
+                if cell is None:
+                    continue
+                rc = self._rotation_centre(host)
+                if math.hypot(cell[0] - rc[0],
+                              cell[1] - rc[1]) <= self.IGBNNMU_ARRIVAL_TOL_M:
+                    self._igbnnmu_stuck_frames[host] = 0
+                    self._igbnnmu_drop_detour(host)
+                    continue
+
+                if host in self._igbnnmu_detour_path:
+                    if self._igbnnmu_walk_detour(host):
+                        self._igbnnmu_drop_detour(host)
+                        self._igbnnmu_seek(host, cell)
+                    continue
+
+                # Re-seek a robot that has drifted off its cell with no
+                # goal left to pull it back.  Nav POPS the goal once it
+                # considers the robot arrived (0.15 m), and a collision
+                # push afterwards can carry it beyond the 0.18 m arrival
+                # tolerance -- at which point nothing was steering it, the
+                # team never read as "in position", and the stall guard had
+                # to break the deadlock instead.
+                if host not in self._nav_goals:
+                    self._igbnnmu_seek(host, cell)
+                    continue
+
+                prev = self._igbnnmu_stuck_poses.get(host)
+                moved = (prev is None
+                         or math.hypot(rc[0] - prev[0], rc[1] - prev[1])
+                         >= self.IGBNNMU_STALL_MOVE_TOL_M)
+                self._igbnnmu_stuck_poses[host] = rc
+                if moved:
+                    self._igbnnmu_stuck_frames[host] = 0
+                    continue
+
+                n = self._igbnnmu_stuck_frames.get(host, 0) + 1
+                self._igbnnmu_stuck_frames[host] = n
+                if n < self.IGBNNMU_REROUTE_FRAME_LIMIT:
+                    continue
+                self._igbnnmu_stuck_frames[host] = 0
+
+                # Nothing to route through means the cell is genuinely
+                # walled in for now: leave the straight goal in place and
+                # let the wait or the stall guard deal with it.
+                if self._igbnnmu_route_to(host, cell):
+                    self._igbnnmu_stuck_reroutes += 1
+
+        def _igbnnmu_hold_heading(self) -> None:
+            """Face a participant up once it has reached its waypoint.
+
+            Ash: "IGBNN waypoint to waypoint -> face upwards upon reaching
+            goal."
+
+            The turn itself is done by the nav controller, which puts a
+            yaw P-controller on grid-up for every Mode 3 lattice hop --
+            the same override GBNN uses (see `igbnnmu_lattice` in
+            _compute_nav_twist).  That controller only runs while a nav
+            goal exists, though, and nav POPS the goal the moment it
+            considers the robot arrived, so a robot that arrives before
+            its yaw has converged would be left part-turned.  This closes
+            the last few degrees on arrival.
+
+            Only for robots on a lattice hop.  A robot on an A* leg -- the
+            initial move to the starting point, a minigraph relocation, or
+            a reroute -- keeps whatever heading its motion profile gives
+            it, and gets squared up when it resumes waypoint-to-waypoint
+            motion.
+            """
+            if self._igbnnmu_planner is None or self._igbnnmu_approach:
+                return
+            north = self.IGBNNMU_NORTH_YAW
+            for host in self._igbnnmu_hosts:
+                if host in self._igbnnmu_detour_path:
+                    continue
+                if host in self._nav_goals:
+                    continue          # still driving; nav owns the yaw
+                p = self.bus.poses.get(host)
+                if p is None or abs(p.yaw - north) < 1e-9:
+                    continue
+                self.bus.poses[host] = Pose(x=p.x, y=p.y, yaw=north)
+
+        def _igbnnmu_route_to(self, host: int, goal: XY) -> bool:
+            """Drive `host` to `goal` along an A* route instead of a
+            straight line.  False when no route exists.
+
+            Shared by the two cases that ask for it: a minigraph-to-
+            minigraph relocation, and a robot that has got stuck.
+            """
+            rc = self._rotation_centre(host)
+            if math.hypot(goal[0] - rc[0],
+                          goal[1] - rc[1]) <= self.IGBNNMU_ARRIVAL_TOL_M:
+                return False
+            grid = self._igbnnmu_route_grid(host, avoid_crew=True)
+            path = pathfind_astar(grid, rc, goal) or []
+            if len(path) < 2:
+                return False
+            self._igbnnmu_detour_path[host] = list(path)
+            self._igbnnmu_detour_idx[host] = 0
+            self._igbnnmu_reroutes += 1
+            self._igbnnmu_walk_detour(host)
+            return True
+
+        def _igbnnmu_drop_detour(self, host: int) -> None:
+            self._igbnnmu_detour_path.pop(host, None)
+            self._igbnnmu_detour_idx.pop(host, None)
+
+        def _igbnnmu_walk_detour(self, host: int) -> bool:
+            """Advance one participant along its reroute polyline.
+
+            True once the polyline is exhausted.  Same cursor as the spawn
+            leg's _igbnnmu_walk_approach.
+            """
+            path = self._igbnnmu_detour_path.get(host)
+            if not path:
+                return True
+            rc = self._rotation_centre(host)
+            idx = self._igbnnmu_detour_idx.get(host, 0)
+            while (idx < len(path)
+                   and math.hypot(path[idx][0] - rc[0],
+                                  path[idx][1] - rc[1])
+                   < self.IGBNNMU_ARRIVAL_TOL_M):
+                idx += 1
+            self._igbnnmu_detour_idx[host] = idx
+            if idx >= len(path):
+                return True
+            self._igbnnmu_seek(host, path[idx])
+            return False
+
+        def _igbnnmu_walk_approach(self, host: int) -> bool:
+            """Advance one participant along its A* approach polyline.
+
+            True once the polyline is exhausted (the robot is at, or has
+            passed, its entry cell).  Mirrors Mode 1's _gbnn_approach cursor.
+            """
+            apath = self._igbnnmu_approach_path.get(host)
+            if not apath:
+                return True
+            rc = self._rotation_centre(host)
+            idx = self._igbnnmu_approach_idx.get(host, 0)
+            while (idx < len(apath)
+                   and math.hypot(apath[idx][0] - rc[0],
+                                  apath[idx][1] - rc[1])
+                   < self.IGBNNMU_ARRIVAL_TOL_M):
+                idx += 1
+            self._igbnnmu_approach_idx[host] = idx
+            if idx >= len(apath):
+                return True
+            self._igbnnmu_seek(host, apath[idx])
+            return False
+
+        def _igbnnmu_all_arrived(self) -> bool:
+            """True when every participant is within tolerance of its target."""
+            tol = self.IGBNNMU_ARRIVAL_TOL_M
+            for host in self._igbnnmu_hosts:
+                # The planner's CELL, not _nav_goals -- while a reroute is
+                # running the nav goal is an intermediate waypoint on the
+                # detour, and measuring against it would report the robot
+                # "arrived" halfway round the obstruction and let the
+                # planner step without it.
+                goal = self._igbnnmu_cell_goal.get(host)
+                if goal is None:
+                    goal = self._nav_goals.get(host)
+                if goal is None:
+                    continue
+                rc_x, rc_y = self._rotation_centre(host)
+                if math.hypot(goal[0] - rc_x, goal[1] - rc_y) > tol:
+                    return False
+            return True
+
+        def _refresh_igbnnmu_active(self) -> None:
+            """Per-tick Mode 3 driver.
+
+            APPROACH  - hold until every participant has reached the entry
+                        cell the planner assigned, then hand over to
+                        coverage.
+            COVERAGE  - advance planner.step() only when both (a) every
+                        participant has reached its current cell and (b) the
+                        frame throttle has elapsed.  Gating on real arrivals
+                        keeps the planner's grid state and the robots'
+                        actual poses from drifting apart, which is what
+                        would happen if the planner free-ran on its own
+                        clock.
+            FINISHING - the planner has emitted its last waypoint but the
+                        robots are still driving toward it.  Hold the run
+                        open until they arrive, THEN tear it down.
+            """
+            planner = self._igbnnmu_planner
+            if planner is None:
+                return
+
+            # A finished run holds its overlay for a beat so the completed
+            # coverage is readable, then clears itself -- otherwise the
+            # highlighted region and the minigraph lattice sit on the map
+            # forever after the robots have stopped.  Mirrors Mode 5's
+            # GBNNH_RESET_AFTER_MS auto-revert.
+            if not self._igbnnmu_active:
+                if self._igbnnmu_done_tick is not None:
+                    elapsed = pygame.time.get_ticks() - self._igbnnmu_done_tick
+                    if elapsed >= self.IGBNNMU_CLEAR_AFTER_MS:
+                        self._cancel_igbnnmu(quiet=True)
+                return
+
+            # A participant that vanished (reset scenario, fission) ends the
+            # run rather than leaving the driver indexing a dead robot.
+            live = [h for h in self._igbnnmu_hosts if h in self.bus.poses]
+            if len(live) != len(self._igbnnmu_hosts):
+                self._cancel_igbnnmu()
+                self._set_message(
+                    "IGBNN-mu: a participant left the sim; run cancelled.",
+                    HUD_WARN)
+                return
+
+            # ---- FINISHING phase ---------------------------------------
+            # planner.step() has returned False, so no further waypoints are
+            # coming -- but the robots are still en route to the last one.
+            # Tearing the run down here (which is what this did) cancelled
+            # their nav goals mid-flight and left them short of the final
+            # cell, so the map looked covered while a robot was visibly
+            # stopped one cell away from where it was sent.
+            #
+            # Hold the run open until they arrive.  The same stall guard
+            # applies, so an unreachable final cell ends the run rather than
+            # hanging it.
+            if self._igbnnmu_finishing:
+                # Re-seek anyone whose goal was popped while still short of
+                # the cell recorded when the phase began.
+                for host, goal in self._igbnnmu_final_goals.items():
+                    if host not in self.bus.poses:
+                        continue
+                    rc = self._rotation_centre(host)
+                    if (math.hypot(goal[0] - rc[0], goal[1] - rc[1])
+                            > self.IGBNNMU_ARRIVAL_TOL_M
+                            and host not in self._igbnnmu_detour_path):
+                        self._igbnnmu_seek(host, goal)
+                # The last cell is the one most likely to need a way round:
+                # the team is at its most tightly packed, and there is no
+                # further planner step coming to shuffle anyone out of the
+                # way.
+                self._igbnnmu_service_detours()
+                self._igbnnmu_hold_heading()
+                # Long fuse.  During the sweep the stall guard has to be
+                # impatient -- a wedged robot freezes the whole schedule.
+                # Here the planner is already finished, so there is no
+                # schedule left to protect and waiting costs nothing but
+                # a second or two.  With the sweep's 3 s fuse, a robot
+                # serialising its way onto a final cell got cut off and
+                # the run ended with it a metre short.
+                if self._igbnnmu_settle(
+                        limit=self.IGBNNMU_FINISH_FRAME_LIMIT):
+                    self._finalise_igbnnmu()
+                return
+
+            # ---- reroute stuck participants ----------------------------
+            # Must run BEFORE the stall guard, which returns early on any
+            # frame where the team is not in position -- which is exactly
+            # the situation a reroute exists to fix.  Placed after it, the
+            # service never ran at all: 11 stall recoveries in a run and
+            # zero reroutes attempted.
+            self._igbnnmu_service_detours()
+
+            # ---- standardised sweep heading ----------------------------
+            self._igbnnmu_hold_heading()
+
+            # ---- stall guard -------------------------------------------
+            # A participant can be physically unable to reach the cell the
+            # planner picked: wedged against an inflated obstacle clearance,
+            # boxed in by another formation, or given a cell A* cannot route
+            # to.  Waiting for it forever freezes the whole sweep, because
+            # the throttle only counts frames in which everyone is in
+            # position.  So if NOBODY has moved for IGBNNMU_STALL_FRAME_LIMIT
+            # frames, accept the poses as they are and let the planner
+            # advance -- the same bargain Mode 5 strikes on AP approach.
+            moved = False
+            for host in self._igbnnmu_hosts:
+                rc = self._rotation_centre(host)
+                prev = self._igbnnmu_stall_poses.get(host)
+                if (prev is None
+                        or math.hypot(rc[0] - prev[0], rc[1] - prev[1])
+                        >= self.IGBNNMU_STALL_MOVE_TOL_M):
+                    moved = True
+                self._igbnnmu_stall_poses[host] = rc
+
+            arrived = self._igbnnmu_all_arrived()
+            self._igbnnmu_stall_count = (
+                0 if (arrived or moved) else self._igbnnmu_stall_count + 1)
+
+            if not arrived:
+                if self._igbnnmu_stall_count < self.IGBNNMU_STALL_FRAME_LIMIT:
+                    self._igbnnmu_frame_counter = 0
+                    return
+                # Stalled.  Force the step outright rather than falling
+                # through to the throttle: the throttle needs
+                # IGBNNMU_FRAMES_PER_STEP *consecutive* in-position frames,
+                # and a stalled team never supplies two in a row -- the very
+                # next frame is still not-arrived, resets the counter, and
+                # returns.  Priming the counter is what actually breaks the
+                # deadlock instead of merely counting it.
+                self._igbnnmu_stall_count = 0
+                self._igbnnmu_stalls += 1
+                self._igbnnmu_frame_counter = self.IGBNNMU_FRAMES_PER_STEP
+                if self._igbnnmu_approach:
+                    self._set_message(
+                        "IGBNN-mu: entry edge unreachable, starting the "
+                        "sweep from where the robots stopped.", HUD_WARN)
+
+            if self._igbnnmu_approach:
+                # Keep walking the A* spawn legs until every participant has
+                # run out of polyline; only then does the sweep begin.
+                still_routing = False
+                for host in self._igbnnmu_hosts:
+                    if not self._igbnnmu_walk_approach(host):
+                        still_routing = True
+                if still_routing:
+                    self._igbnnmu_frame_counter = 0
+                    return
+                self._igbnnmu_approach = False
+                self._igbnnmu_approach_path = {}
+                self._igbnnmu_approach_idx = {}
+                self._set_message(
+                    "IGBNN-mu: entry edge reached, sweeping.", HUD_OK)
+
+            self._igbnnmu_frame_counter += 1
+            if self._igbnnmu_frame_counter < self.IGBNNMU_FRAMES_PER_STEP:
+                return
+            self._igbnnmu_frame_counter = 0
+
+            transit_before = getattr(planner, "_phase", "") == "transit"
+            running = planner.step()
+            transit = (transit_before
+                       or getattr(planner, "_phase", "") == "transit")
+
+            for i, cell in enumerate(planner.robot_global_positions()):
+                if i >= len(self._igbnnmu_hosts):
+                    break
+                h = self._igbnnmu_hosts[i]
+                target = self._igbnnmu_cell_to_world(cell)
+                self._igbnnmu_cell_goal[h] = target
+                self._igbnnmu_drop_detour(h)
+                self._igbnnmu_stuck_frames[h] = 0
+                # Ash: "when robot is moving from one minigraph to the
+                # next, astar is executed and abide set motion profile."
+                # The planner reports that relocation as its transit
+                # phase, so every move made during it is routed rather
+                # than driven as a straight lattice hop -- which also
+                # means it picks up the user's motion profile and
+                # direction-of-travel yaw, the same as any other A* leg.
+                if transit and self._igbnnmu_route_to(h, target):
+                    continue
+                self._igbnnmu_seek(h, target)
+            # Re-assert after the step: a robot that has just finished a
+            # detour resumes waypoint-to-waypoint motion here, and should
+            # be facing north on the very frame it does, not the next one.
+            self._igbnnmu_hold_heading()
+
+            if not running:
+                # Last waypoint issued by the seek loop above.  Let the
+                # robots actually get there before finalising.
+                #
+                # Record those cells rather than reading them back out of
+                # _nav_goals later: the nav controller POPS a goal the
+                # moment it considers the robot arrived, and anything else
+                # that cancels a goal (a failed replan, a formation event)
+                # pops it too.  _igbnnmu_all_arrived treats a host with no
+                # goal as arrived, so a goal that disappeared for any other
+                # reason used to read as "done" and ended the run with the
+                # robot still short of the cell -- 0.29 m in one measured
+                # run, against a 0.18 m tolerance.  With the cells recorded
+                # here, FINISHING checks real distances and re-seeks anyone
+                # whose goal went missing while still out of position.
+                self._igbnnmu_final_goals = {
+                    h: self._igbnnmu_cell_goal[h]
+                    for h in self._igbnnmu_hosts
+                    if h in self._igbnnmu_cell_goal
+                }
+                self._igbnnmu_finishing = True
+                self._igbnnmu_stall_count = 0
+                self._igbnnmu_stall_poses = {}
+                self._set_message(
+                    f"IGBNN-mu: coverage planned — "
+                    f"{len(self._igbnnmu_hosts)} robot(s) driving to the "
+                    f"final cell.", HUD_ACCENT)
+
+        def _igbnnmu_settle(self, limit: Optional[int] = None) -> bool:
+            """Advance the arrival / stall bookkeeping by one frame.
+
+            True once the team is in position, or once it has stopped
+            making progress for long enough that waiting is pointless.
+            Shared by the coverage stall guard and the FINISHING phase so
+            the two cannot drift apart.
+            """
+            moved = False
+            for host in self._igbnnmu_hosts:
+                rc = self._rotation_centre(host)
+                prev = self._igbnnmu_stall_poses.get(host)
+                if (prev is None
+                        or math.hypot(rc[0] - prev[0], rc[1] - prev[1])
+                        >= self.IGBNNMU_STALL_MOVE_TOL_M):
+                    moved = True
+                self._igbnnmu_stall_poses[host] = rc
+
+            if self._igbnnmu_all_arrived():
+                self._igbnnmu_stall_count = 0
+                return True
+
+            self._igbnnmu_stall_count = (
+                0 if moved else self._igbnnmu_stall_count + 1)
+            if self._igbnnmu_stall_count >= (
+                    self.IGBNNMU_STALL_FRAME_LIMIT if limit is None else limit):
+                self._igbnnmu_stall_count = 0
+                self._igbnnmu_stalls += 1
+                return True
+            return False
+
+        def _finalise_igbnnmu(self) -> None:
+            """End the run: capture stats, release the robots, report."""
+            planner = self._igbnnmu_planner
+            if planner is None:
+                return
+            _paths, stats = planner.final_result()
+            self._igbnnmu_active    = False
+            self._igbnnmu_finishing = False
+            self._igbnnmu_stats     = stats
+            self._igbnnmu_done_tick = pygame.time.get_ticks()
+            for host in self._igbnnmu_hosts:
+                self._cancel_nav(host)
+            note = (f"  ({self._igbnnmu_stalls} stall recover"
+                    f"{'y' if self._igbnnmu_stalls == 1 else 'ies'})"
+                    if self._igbnnmu_stalls else "")
+            self._set_message(
+                f"IGBNN-mu complete: {stats['coverage'] * 100:.1f}% "
+                f"coverage ({stats['covered_cells']}/"
+                f"{stats['free_cells']} cells) in "
+                f"{stats['steps']} steps.{note}",
+                HUD_OK)
+
+        def _cancel_igbnnmu(self, quiet: bool = False) -> None:
+            """Clear every piece of Mode 3 state and stop the participants."""
+            had = self._igbnnmu_planner is not None
+            for host in getattr(self, "_igbnnmu_hosts", []):
+                if host in self.bus.poses:
+                    self._cancel_nav(host)
+            self._igbnnmu_planner   = None
+            self._igbnnmu_roi       = None
+            self._igbnnmu_hosts     = []
+            self._igbnnmu_active    = False
+            self._igbnnmu_started   = False
+            self._igbnnmu_approach  = False
+            self._igbnnmu_finishing = False
+            self._igbnnmu_approach_path = {}
+            self._igbnnmu_approach_idx  = {}
+            self._igbnnmu_final_goals   = {}
+            self._igbnnmu_cell_goal     = {}
+            self._igbnnmu_detour_path   = {}
+            self._igbnnmu_detour_idx    = {}
+            self._igbnnmu_stuck_frames  = {}
+            self._igbnnmu_stuck_poses   = {}
+            self._igbnnmu_reroutes      = 0
+            self._igbnnmu_stuck_reroutes = 0
+            self._igbnnmu_frame_counter = 0
+            self._igbnnmu_stall_count = 0
+            self._igbnnmu_stall_poses = {}
+            self._igbnnmu_stalls    = 0
+            self._igbnnmu_stats     = None
+            self._igbnnmu_origin    = (0.0, 0.0)
+            self._igbnnmu_grid_shape = (0, 0)
+            if had and not quiet:
+                self._set_message("IGBNN-mu cleared.", HUD_WARN)
+
+        def _cancel_all_for(self, host: int) -> List[str]:
+            """Cancel every planner driving `host`, and report which.
+
+            Bound to X.  The key used to cancel A* nav only, which meant a
+            robot under GBNN, Inter-Star, GBNN+H or IGBNN-mu simply picked
+            its goal straight back up on the next tick -- the planner was
+            still running and re-issued it.  Cancelling has to reach the
+            planner, not just the goal it happens to have set.
+
+            Scoped to the robot the user is controlling.  A mode is torn
+            down only if THIS host is part of it; a run belonging to some
+            other robot is left alone.
+
+            Inter-Star and IGBNN-mu are joint plans over several robots,
+            so when the host is one of their participants the whole plan
+            goes.  Cancelling one robot out of a fusion or a coverage
+            sweep would leave the remaining robots driving a plan that no
+            longer describes the team.
+
+            Lives in the Mode 3 block because Mode 3 was the last mode
+            added and this is the one place that has to know about all of
+            them.
+            """
+            cancelled: List[str] = []
+
+            # A* / point-to-point nav.
+            if host in self._nav_goals or host in self._nav_paths:
+                cancelled.append("A*")
+            self._cancel_nav(host)
+
+            # Mode 1 - single-robot GBNN coverage.
+            if host in self._gbnn_planner_for:
+                self._gbnn_planner_for.pop(host, None)
+                self._gbnn_approach.pop(host, None)
+                self._gbnn_approach_idx.pop(host, None)
+                cancelled.append("GBNN")
+
+            # Mode 2 - Inter-Star.
+            if host in self._interstar_paths:
+                for rid in list(self._interstar_paths.keys()):
+                    self._cancel_nav(rid)
+                self._interstar_paths          = {}
+                self._interstar_cursor         = {}
+                self._interstar_shared_segment = []
+                self._interstar_metrics        = {}
+                self._interstar_pending_fuses  = []
+                self._interstar_plan_active    = False
+                self._interstar_fusion_pairs   = []
+                self._interstar_staging_active = False
+                self._interstar_staging_slots  = {}
+                self._interstar_mode           = ""
+                self._interstar_fusion_goal    = None
+                self._interstar_selected_cache = []
+                cancelled.append("Inter-Star")
+
+            # Mode 5 - GBNN+H.
+            if self._gbnnh_host_rid == host and (
+                    self._gbnnh_active
+                    or self._gbnnh_aps
+                    or self._gbnnh_planner is not None):
+                self._cancel_nav(host)
+                self._gbnnh_active          = False
+                self._gbnnh_host_rid        = None
+                self._gbnnh_aps             = []
+                self._gbnnh_active_ap_idx   = None
+                self._gbnnh_planner         = None
+                self._gbnnh_completion_tick = None
+                self._gbnnh_stall_pos       = None
+                self._gbnnh_stall_count     = 0
+                self._gbnnh_step_frame_counter = 0
+                cancelled.append("GBNN+H")
+
+            # Mode 3 - IGBNN-mu.
+            if host in self._igbnnmu_hosts:
+                self._cancel_igbnnmu(quiet=True)
+                cancelled.append("IGBNN-mu")
+
+            return cancelled
+
+        def _igbnnmu_raster_frame(self):
+            """Screen-space geometry of the RoI raster, or None.
+
+            Shared by the two render passes so the shading below the
+            robots and the lattice above them cannot drift apart.
+            """
+            planner = self._igbnnmu_planner
+            if planner is None or self._igbnnmu_roi is None:
+                return None
+            rows, cols = self._igbnnmu_grid_shape
+            if rows == 0 or cols == 0:
+                return None
+            cs = self.IGBNNMU_CELL_M
+            ox, oy = self._igbnnmu_origin
+            x_edges = [self._world_to_screen(ox + c * cs, oy)[0]
+                       for c in range(cols + 1)]
+            y_edges = [self._world_to_screen(ox, oy + r * cs)[1]
+                       for r in range(rows + 1)]
+            W = x_edges[-1] - x_edges[0]
+            H = y_edges[0] - y_edges[-1]
+            if W <= 0 or H <= 0:
+                return None
+            return rows, cols, x_edges, y_edges, x_edges[0], y_edges[-1], W, H
+
+        def _draw_igbnnmu_cells(self) -> None:
+            """Bottom layer -- coverage shading only, BELOW the robots.
+
+            Mirrors Mode 1's _draw_gbnn_cells / _draw_gbnn_overlay split.
+            Drawn in the top pass with everything else, the shading tinted
+            straight over the robots and they read as buried under the
+            selected area; the robots have to be on top of the region they
+            are covering.
+            """
+            fr = self._igbnnmu_raster_frame()
+            if fr is None:
+                return
+            planner = self._igbnnmu_planner
+            rows, cols, x_edges, y_edges, dx, dy, W, H = fr
+            surf = pygame.Surface((W, H), pygame.SRCALPHA)
+
+            # planner.state may be larger than the raster (Section IV-C
+            # padding), so iterate the raster and index into it -- the pad
+            # strip lies outside the drawn RoI and must not be shaded.
+            state = planner.state if self._igbnnmu_started else planner.full_grid
+            for r in range(rows):
+                for c in range(cols):
+                    v = float(state[r, c])
+                    if v == -1.0:
+                        col = (210, 60, 60, 55)
+                    elif v == 1.0:
+                        col = (70, 150, 235, 70)        # unvisited
+                    else:
+                        col = (40, 80, 130, 110)        # visited
+                    x0 = x_edges[c] - dx
+                    x1 = x_edges[c + 1] - dx
+                    y0 = y_edges[r + 1] - dy
+                    y1 = y_edges[r] - dy
+                    pygame.draw.rect(
+                        surf, col,
+                        pygame.Rect(x0, y0, max(1, x1 - x0), max(1, y1 - y0)))
+            self.screen.blit(surf, (dx, dy))
+
+        def _draw_igbnnmu_overlay(self) -> None:
+            """Mode 3 overlay: coverage shading, minigraph lattice, trails.
+
+            Drawn in the top render pass so it stays legible over robots and
+            obstacles, matching how Modes 1 and 5 present their overlays.
+            """
+            planner = self._igbnnmu_planner
+            rect = self._igbnnmu_roi
+            if planner is None or rect is None:
+                return
+
+            fr = self._igbnnmu_raster_frame()
+            if fr is None:
+                return
+            rows, cols, x_edges, y_edges, dx, dy, W, H = fr
+            # Still needed further down by the combined-unit outline,
+            # which works in cell CORNER coordinates rather than off the
+            # edge tables.
+            cs = self.IGBNNMU_CELL_M
+            ox, oy = self._igbnnmu_origin
+            surf = pygame.Surface((W, H), pygame.SRCALPHA)
+
+            # ---- minigraph lattice ------------------------------------
+            h_m, v_m = planner._mini_shape
+            if h_m and v_m:
+                for r in range(0, rows + 1, h_m):
+                    y = y_edges[min(r, rows)] - dy
+                    pygame.draw.line(surf, (255, 190, 60, 150),
+                                     (0, y), (W, y), 1)
+                for c in range(0, cols + 1, v_m):
+                    x = x_edges[min(c, cols)] - dx
+                    pygame.draw.line(surf, (255, 190, 60, 150),
+                                     (x, 0), (x, H), 1)
+
+            # ---- current minigraph highlight --------------------------
+            if self._igbnnmu_started and planner._order:
+                ro, co = planner._ro, planner._co
+                x0 = x_edges[min(co, cols)] - dx
+                x1 = x_edges[min(co + v_m, cols)] - dx
+                y0 = y_edges[min(ro + h_m, rows)] - dy
+                y1 = y_edges[min(ro, rows)] - dy
+                pygame.draw.rect(
+                    surf, (255, 210, 90, 230),
+                    pygame.Rect(x0, y0, max(1, x1 - x0), max(1, y1 - y0)), 2)
+
+            self.screen.blit(surf, (dx, dy))
+
+            # ---- RoI border -------------------------------------------
+            p0 = self._world_to_screen(rect.x0, rect.y0)
+            p1 = self._world_to_screen(rect.x1, rect.y1)
+            pygame.draw.rect(
+                self.screen, (120, 190, 255),
+                pygame.Rect(min(p0[0], p1[0]), min(p0[1], p1[1]),
+                            abs(p1[0] - p0[0]), abs(p1[1] - p0[1])), 2)
+
+            # ---- per-robot coverage paths -----------------------------
+            # Drawn from the PLANNER's cell sequence, snapped to cell
+            # centres -- the same source and the same convention Mode 1
+            # uses (_draw_gbnn_trail reads state["path_cells"] and maps
+            # each cell to its centre).
+            #
+            # This used to draw `_igbnnmu_trail`, a per-tick sample of
+            # `_rotation_centre` at 5 cm resolution -- i.e. odometry.  The
+            # two lines answer different questions, and that alone made
+            # Mode 3 look like it moved worse than Mode 1: a cell-centre
+            # polyline is exact right angles by construction, while a pose
+            # trail shows the A* approach staircase, every collision
+            # nudge and every wait-and-go, none of which Mode 1's line
+            # would have shown either.  Same source, same convention, and
+            # the two modes are finally comparable.
+            paths = (planner.render_state() or {}).get("paths") or {}
+            for i, cells in sorted(paths.items()):
+                if i >= len(self._igbnnmu_hosts) or len(cells) < 2:
+                    continue
+                host = self._igbnnmu_hosts[i]
+                col = ROBOT_COLOURS[(int(host) - 1) % len(ROBOT_COLOURS)]
+                pts = [self._world_to_screen(*self._igbnnmu_cell_to_world(c))
+                       for c in cells]
+                pygame.draw.lines(self.screen, col, False, pts, 2)
+
+            # ---- combined-unit outline --------------------------------
+            # Two robots that have inter-reconfigured are one rigid body
+            # planning as a single agent (Section III-C), and the enlarged
+            # footprint is what neuron skipping is measured against.  Drawn
+            # as one silhouette around the union of their cells rather than
+            # as links between centres, so an L-shaped or staggered
+            # morphology reads as the shape it actually is.  The planner
+            # owns both the grouping and the outline geometry, so the
+            # pygame view and the standalone matplotlib view draw the same
+            # thing from the same source.
+            #
+            # Nothing physically docks in this increment -- the Configurer
+            # FSM is not driven -- so this is the algorithm's notion of a
+            # combined unit, not the sim's.
+            if (self._igbnnmu_started and not self._igbnnmu_approach
+                    and getattr(planner, "_phase", None) == "cover"):
+                cells = planner.robot_global_positions()
+                for root, members in planner.combined_units().items():
+                    if len(members) < 2 or root >= len(self._igbnnmu_hosts):
+                        continue
+                    host = self._igbnnmu_hosts[root]
+                    col = ROBOT_COLOURS[(int(host) - 1) % len(ROBOT_COLOURS)]
+                    try:
+                        member_cells = [cells[i] for i in members]
+                    except IndexError:
+                        continue
+                    for (c0, r0), (c1, r1) in planner.outline_segments(
+                            member_cells):
+                        a = self._world_to_screen(ox + c0 * cs, oy + r0 * cs)
+                        b = self._world_to_screen(ox + c1 * cs, oy + r1 * cs)
+                        # White casing first: the host colour alone reads
+                        # poorly over both the light unvisited tint and the
+                        # dark visited one.
+                        pygame.draw.line(self.screen, (255, 255, 255), a, b, 6)
+                        pygame.draw.line(self.screen, col, a, b, 3)
 
         def _merge_nav_for_uninvolved(
             self,
@@ -8780,6 +10410,9 @@ def _run_pygame_teleop() -> int:
             # tint doesn't occlude anything above (wall edges stay crisp,
             # robots remain fully visible over their visited cells).
             self._draw_gbnn_cells()
+            # Mode 3: the same split -- coverage shading below the
+            # robots, lattice and paths above them.
+            self._draw_igbnnmu_cells()
             # Inter-Star path overlay — drawn BELOW hulls/obstacles/robots
             # so the rendered path plan appears as a background underlay,
             # occluded by physical entities above it.
@@ -8790,13 +10423,23 @@ def _run_pygame_teleop() -> int:
             self._draw_paths()
             self._draw_rotation_centres()
             self._draw_caster_trolleys()   # HIGH/HEAVY above hulls, below robots
+            # Three z-passes, not one per robot.  Footprints are ground
+            # markings and must all sit below every body; the star and the
+            # name label are annotations and must all sit above every
+            # body.  Drawn per robot, whichever robot came later in the
+            # loop buried its neighbour.
+            for rid in sorted(self.bus.configurers.keys()):
+                self._draw_robot_ground(rid)
             for rid in sorted(self.bus.configurers.keys()):
                 self._draw_robot(rid)      # robots on top (translucent when under)
-            self._draw_mounted_mdas()      # Phase E: MDAs at z+1 above host
-            # Phase A overlay above the scene (RoI border, GBNN cursor
+            for rid in sorted(self.bus.configurers.keys()):
+                self._draw_robot_label(rid)
+            self._draw_mounted_mdas()      # GBNN+H: MDAs at z+1 above host
+            # Coverage overlay above the scene (RoI border, GBNN cursor
             # ring, visit trail).  Inter-Star moved to underlay above.
             self._draw_gbnn_overlay()
-            self._draw_gbnnh_overlay()          # Phase E (Mode 5) AP markers + cone
+            self._draw_igbnnmu_overlay()          # Mode 3 coverage + lattice
+            self._draw_gbnnh_overlay()          # Mode 5 AP markers + cone
             self._draw_pending_fission_stars()  # yellow goal stars pre-dispatch
             self._draw_gbnn_drag_preview()
             self._draw_drag_spawn_preview()
@@ -8828,10 +10471,11 @@ def _run_pygame_teleop() -> int:
                 self._dbg_collision_push.clear()
                 self._dbg_nav_reason.clear()
 
-                # Phase A scaffolds — idle in mode 1 but plumbed for Phase B+
+                # Scaffolds — idle in mode 1 but plumbed for the other planners
                 self._refresh_gbnn_active()
                 self._refresh_interstar_active()
-                self._refresh_gbnnh_active()       # Phase E (Mode 5)
+                self._refresh_igbnnmu_active()       # Mode 3
+                self._refresh_gbnnh_active()       # Mode 5
                 # Snap mounted MDA modules to their host pose this tick so
                 # they render glued to the robot.  Cheap; runs always.
                 self.obs_mgr.sync_mounted_mdas({
@@ -8946,10 +10590,15 @@ def _run_pygame_teleop() -> int:
                 # from last frame (prevents teleop through walls)
                 distribution = self._clamp_vel_against_walls(distribution)
 
-                # Phase B: Interstar-active robots wait when next waypoint
+                # Inter-Star:-active robots wait when next waypoint
                 # is occupied by another robot (serialised arrival onto
                 # the shared fusion cell).
                 distribution = self._apply_interstar_waypoint_wait(
+                    distribution)
+                # Mode 3: same serialisation for Mode 3 participants -- a
+                # robot holds rather than driving into a cell another
+                # participant already occupies.
+                distribution = self._apply_igbnnmu_waypoint_wait(
                     distribution)
 
                 # Step physics
@@ -9006,6 +10655,13 @@ def _run_pygame_teleop() -> int:
     # ------------------------------------------------------------------
     #  Launch
     # ------------------------------------------------------------------
+    # Test hook.  TeleopSim is defined inside this function so that
+    # importing demo.py never initialises pygame/SDL; headless tests still
+    # need the class, and returning it here is the only way to reach it
+    # without starting the main loop.  Never set by the normal entry point.
+    if _return_class:
+        return TeleopSim            # type: ignore[return-value]
+
     try:
         TeleopSim().run()
     except KeyboardInterrupt:
@@ -9030,19 +10686,19 @@ def _run_pygame_teleop() -> int:
 # ============================================================================
 
 # ============================================================================
-# PHASE A — Headless test suite + SB3/Py-3.8 PPO load spike
+# PHASE A — Headless test suite
 # ============================================================================
 
 
 def run_headless_test() -> int:
-    """Validate Phase A's pipeline end-to-end without pygame.
+    """Validate the planner pipeline end-to-end without pygame.
 
     Scenarios:
       1. Configurer FSM      — fusion handshake + fission reset.
       2. DefaultPlanner      — A* on an empty grid yields a valid path.
       3. GBNNBasePlanner     — RoI runs to 100 % coverage.
       4. GBNN integration    — coverage path matches a hand-checked length.
-      5. Phase A contracts   — PlanResult dataclasses serialise / round-trip.
+      5. Planner contracts   — PlanResult dataclasses serialise / round-trip.
 
     Returns 0 on pass, non-zero otherwise.
     """
@@ -9142,7 +10798,7 @@ def run_headless_test() -> int:
         print(f"       OK — visited {len(cells)} cells over a {rows}×{cols} grid")
 
     # ---- 5. PlanResult round-trip ----
-    print("[test] 5/7 Phase A PlanResult dataclass round-trip")
+    print("[test] 5/7 PlanResult dataclass round-trip")
     pr = PlanResult(
         assignments={1: [(0.0, 0.0), (1.0, 0.0)]},
         reconfig=[ReconfigCommand(recipient_id=2,
@@ -9320,7 +10976,7 @@ def run_headless_test() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("All Phase A + B headless tests PASSED.")
+    print("All headless tests PASSED.")
     return 0
 
 
@@ -9328,7 +10984,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Spyder Ascend unified demo (Configurer teleop + Phase A)."
+        description="Spyder Ascend unified demo (Configurer teleop + planner layer)."
     )
     parser.add_argument(
         "--demo", action="store_true",
@@ -9344,7 +11000,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--test", action="store_true",
-        help="Run the Phase A headless test suite (no display).",
+        help="Run the headless test suite (no display).",
     )
     args = parser.parse_args()
 

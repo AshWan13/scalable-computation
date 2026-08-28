@@ -4,11 +4,11 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 
-> Reference implementation of three published algorithms for inter-reconfigurable robot autonomy, each with provable complexity bounds and verified on physical platforms.
+> Reference implementation of four algorithms for inter-reconfigurable robot autonomy, each with provable complexity bounds and verified on physical platforms.
 
 ![Hero — three algorithms running side-by-side](assets/hero.png)
 
-**New to inter-reconfigurable robots?** Run `python demo.py` — the interactive sandbox is designed for researchers, students, and developers to learn, build on, and experiment with the three algorithms in a unified scene.
+**New to inter-reconfigurable robots?** Run `python demo.py` — the interactive sandbox is designed for researchers, students, and developers to learn, build on, and experiment with the four algorithms in a unified scene.
 
 ---
 
@@ -18,11 +18,12 @@
 |--------|--------------|----------|-------|
 | [`configurer/`](configurer/) — `open_configurer.py` | FSM for fusion / fission control — *Constant Complexity Framework* | O(n) → O(1) complexity | [IEEE T-ASE 2024](https://ieeexplore.ieee.org/abstract/document/10589354) |
 | [`interstar/`](interstar/) — `open_interstar.py` | Modified Multi-A* for docking / splitting robots — *Inter-Star Algorithm* | O(log n · x) complexity | [Elsevier ESWA 2025](https://www.sciencedirect.com/science/article/abs/pii/S0957417425027514) |
+| [`igbnnmu/`](igbnnmu/) — `open_igbnnmu.py` | Coverage planner for robots that fuse and split mid-sweep — *IGBNN-μ* | Coverage effort per robot falls as the team grows | IEEE T-SMC: Systems — *DOI pending* |
 | [`gbnnh/`](gbnnh/) — `open_gbnnh.py` | Hierarchical GBNN for dual-arm coverage — *GBNN+H* | Heuristic runtime speedup over baseline GBNN | [Springer Complex & Intelligent Systems 2024](https://link.springer.com/article/10.1007/s40747-024-01483-3) |
 
 Click a module name to land on its README — each contains the full paper citation (BibTeX), DOI link, and funding details.
 
-> *Two additional algorithms from the same thesis are slated for future releases.*
+> *One pending algorithm from the same thesis is slated for a future release.*
 
 ---
 
@@ -76,13 +77,14 @@ From the repository root:
 python demo.py
 ```
 
-This launches the unified matplotlib + pygame sandbox, combining the three algorithms into a single interactive scene — teleop a robot, place obstacles, trigger Inter-Star path planning, run GBNN+H coverage.
+This launches the unified matplotlib + pygame sandbox, combining the four algorithms into a single interactive scene — teleop a robot, place obstacles, trigger Inter-Star path planning, run IGBNN-μ multi-robot coverage, run GBNN+H coverage.
 
 ### Importing classes into your own code
 
 ```python
 from configurer.open_configurer import Configurer
 from interstar.open_interstar import Interstar
+from igbnnmu.open_igbnnmu import IGBNN_mu
 from gbnnh.open_gbnnh import GBNN_H
 
 # Each class is importable standalone — no rendering dependencies.
@@ -113,7 +115,7 @@ To leave the venv: `deactivate`. To re-enter next time: `source .venv/bin/activa
 conda create -n scalable-comp python=3.11 -y
 conda activate scalable-comp
 pip install -e ".[matplotlib,pygame]"
-python demo.py --test     # headless sanity check; expected: "All Phase A + B headless tests PASSED."
+python demo.py --test     # headless sanity check; expected: "All headless tests PASSED."
 python demo.py            # interactive sandbox
 ```
 
@@ -232,6 +234,23 @@ Number keys `1`–`5` select which robot is currently active for control. The nu
 
 - `T` — toggle trolley attachment / detachment for the selected robot.
 
+### Multi-robot coverage (Mode 3, IGBNN-μ)
+
+Selection state chooses the planner, the same way it does for Inter-Star:
+**select the robots first, then draw the area.**
+
+| Input | Action |
+|---|---|
+| **Ctrl + LMB** on a robot | Add / remove it from the selection (shared with Mode 2). |
+| **LMB-drag** an area, robots selected | Run IGBNN-μ coverage over that region with the selected robots. Starts immediately — the robots head for the first minigraph's entry edge as soon as you release. |
+| **LMB-drag** an area, nothing selected | Falls through to Mode 1 — single-robot GBNN for the active robot. |
+| **Esc** | Cancel the run. |
+
+> Selection is **Ctrl**, not **Shift** — Shift + LMB places a Mode 5 access point.
+
+A *drag* selects the coverage planner; a *tap* still goes to navigation and
+Inter-Star, so the two gestures never collide.
+
 ### Access points (Mode 5, GBNN+H)
 
 - `Shift + LMB` on empty floor near (within 1.2 m of) an obstacle places an access point. Yaw points from the click toward the nearest obstacle's nearest surface point.
@@ -247,8 +266,8 @@ Number keys `1`–`5` select which robot is currently active for control. The nu
 
 ### Cancelling and exiting
 
-- `X` — cancel the current navigation for the selected robot's formation.
-- `Esc` — cancel current selection / fission queue / active plan; press again with nothing active to quit.
+- `X` — cancel **everything** driving the selected robot's formation: A\* navigation, GBNN coverage, Inter-Star, GBNN+H and IGBNN-μ. A robot that is not part of a run is left alone, and because Inter-Star and IGBNN-μ are joint plans across several robots, cancelling one participant ends the whole plan.
+- `Esc` — cancel the current selection, fission queue and any active plan. It never closes the sandbox; use the window's close button to quit.
 
 ### Rotation centre
 
@@ -276,7 +295,7 @@ Machine-readable citation metadata is in [`CITATION.cff`](CITATION.cff). To cite
 
 Released under the [BSD 3-Clause License](LICENSE). Copyright © 2025 Singapore University of Technology and Design and Ash Wan Yaw Sang.
 
-The Glasius Bioinspired Neural Network reference implementation in [`replicated_gbnn.py`](replicated_gbnn.py) is a re-implementation of prior work by Glasius, Komoda, & Gielen (1995). The A\* algorithm (Hart, Nilsson, & Raphael, 1968) and Dijkstra's algorithm (Dijkstra, 1959) are included as base path-planning functions used to demonstrate deployed inter-reconfigurable robots. Credit for these classical algorithms belongs to their original authors.
+The Glasius Bioinspired Neural Network reference implementation in [`common/replicated_gbnn.py`](common/replicated_gbnn.py) is a re-implementation of prior work by Glasius, Komoda, & Gielen (1995). The A\* algorithm (Hart, Nilsson, & Raphael, 1968) and Dijkstra's algorithm (Dijkstra, 1959) are included as base path-planning functions used to demonstrate deployed inter-reconfigurable robots. Credit for these classical algorithms belongs to their original authors.
 
 ---
 
@@ -305,6 +324,10 @@ scalable-computation/
 │   ├── open_interstar.py
 │   └── README.md
 │
+├── igbnnmu/                 IGBNN-μ (IEEE T-SMC: Systems)
+│   ├── open_igbnnmu.py
+│   └── README.md
+│
 └── gbnnh/                   GBNN+H (Complex & Intelligent Systems 2024)
     ├── open_gbnnh.py
     └── README.md
@@ -312,7 +335,7 @@ scalable-computation/
 
 ## Acknowledgements
 
-This work has been adapted into a simplified simulation. The original work was carried out at the [Singapore University of Technology and Design](https://www.sutd.edu.sg/) under the supervision of **Prof. Mohan Rajesh Elara**. The first author was supported by the **SUTD President's Graduate Fellowship — Computing and Information Science Disciplines**.
+This work has been adapted into a simplified simulation. The original work was carried out at the Singapore University of Technology and Design under the supervision of **Prof. Mohan Rajesh Elara**. The first author was supported by the **SUTD President's Graduate Fellowship — Computing and Information Science Disciplines**.
 
 This research was supported by the National Robotics Programme under its NRP BAU, *Ermine III: Deployable Reconfigurable Robots* (Award No. **M22NBK0054**), and by A\*STAR under the RIE2025 IAF-PP programmes — *Advanced ROS2-native Platform Technologies for Cross-sectorial Robotics Adoption* (Award No. **M21K1a0104**) and *Modular Reconfigurable Mobile Robots (MR)²* (Grant No. **M24N2a0039**). Per-paper funding details are in each module's README.
 

@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it using the metadata below, and the specific paper for the algorithm you use (see each module's README)."
 type: software
 title: "Scalable Computation — Inter-Reconfigurable Robots"
-abstract: "Reference implementation of three published algorithms for inter-reconfigurable robot autonomy, verified on physical platforms."
+abstract: "Reference implementation of four algorithms for inter-reconfigurable robot autonomy, verified on physical platforms."
 authors:
   - family-names: "Wan"
     given-names: "Ash Yaw Sang"
@@ -11,8 +11,8 @@ authors:
     affiliation: "Singapore University of Technology and Design"
 repository-code: "https://github.com/AshWan13/scalable-computation"
 url: "https://github.com/AshWan13/scalable-computation"
-version: "0.1.0"
-date-released: "2026-04-16"
+version: "1.1.0"
+date-released: "2026-08-28"
 license: BSD-3-Clause
 keywords:
   - inter-reconfigurable robots

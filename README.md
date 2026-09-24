@@ -4,11 +4,11 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 
-> Reference implementation of four algorithms for inter-reconfigurable robot autonomy, each with provable complexity bounds and verified on physical platforms.
+> Reference implementation of four published algorithms for inter-reconfigurable robot autonomy, each with provable complexity bounds and verified on physical platforms.
 
 ![Hero — three algorithms running side-by-side](assets/hero.png)
 
-**New to inter-reconfigurable robots?** Run `python demo.py` — the interactive sandbox is designed for researchers, students, and developers to learn, build on, and experiment with the four algorithms in a unified scene.
+**New to inter-reconfigurable robots?** Run `python demo.py` — the interactive sandbox is designed for researchers, students, and developers to learn, build on, and experiment with the four published algorithms in a unified scene.
 
 ---
 
@@ -18,7 +18,7 @@
 |--------|--------------|----------|-------|
 | [`configurer/`](configurer/) — `open_configurer.py` | FSM for fusion / fission control — *Constant Complexity Framework* | O(n) → O(1) complexity | [IEEE T-ASE 2024](https://ieeexplore.ieee.org/abstract/document/10589354) |
 | [`interstar/`](interstar/) — `open_interstar.py` | Modified Multi-A* for docking / splitting robots — *Inter-Star Algorithm* | O(log n · x) complexity | [Elsevier ESWA 2025](https://www.sciencedirect.com/science/article/abs/pii/S0957417425027514) |
-| [`igbnnmu/`](igbnnmu/) — `open_igbnnmu.py` | Coverage planner for robots that fuse and split mid-sweep — *IGBNN-μ* | Coverage effort per robot falls as the team grows | IEEE T-SMC: Systems — *DOI pending* |
+| [`igbnnmu/`](igbnnmu/) — `open_igbnnmu.py` | Coverage planner for robots that fuse and split mid-sweep — *IGBNN-μ* | O((log n)⁻¹) complexity in robot count | [IEEE T-SMC Systems 2026](https://ieeexplore.ieee.org/document/11700393) |
 | [`gbnnh/`](gbnnh/) — `open_gbnnh.py` | Hierarchical GBNN for dual-arm coverage — *GBNN+H* | Heuristic runtime speedup over baseline GBNN | [Springer Complex & Intelligent Systems 2024](https://link.springer.com/article/10.1007/s40747-024-01483-3) |
 
 Click a module name to land on its README — each contains the full paper citation (BibTeX), DOI link, and funding details.
@@ -77,7 +77,7 @@ From the repository root:
 python demo.py
 ```
 
-This launches the unified matplotlib + pygame sandbox, combining the four algorithms into a single interactive scene — teleop a robot, place obstacles, trigger Inter-Star path planning, run IGBNN-μ multi-robot coverage, run GBNN+H coverage.
+This launches the unified matplotlib + pygame sandbox, combining the four published algorithms into a single interactive scene — teleop a robot, place obstacles, trigger Inter-Star path planning, run IGBNN-μ multi-robot coverage, run GBNN+H coverage.
 
 ### Importing classes into your own code
 
@@ -324,7 +324,7 @@ scalable-computation/
 │   ├── open_interstar.py
 │   └── README.md
 │
-├── igbnnmu/                 IGBNN-μ (IEEE T-SMC: Systems)
+├── igbnnmu/                 IGBNN-μ (IEEE T-SMC Systems 2026)
 │   ├── open_igbnnmu.py
 │   └── README.md
 │

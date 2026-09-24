@@ -1,7 +1,7 @@
 # IGBNN-μ — Complete Coverage for Inter-Reconfigurable Robots
 
 > **Algorithm:** Glasius Bioinspired Neural Network coverage planner for robots that fuse and split mid-sweep, with minigraph decomposition.
-> **Complexity:** O(log n)⁻¹ — coverage effort per robot falls as the team grows.
+> **Complexity:** O((log n)⁻¹) — inverse logarithmic in robot count; coverage effort per robot falls as the team grows.
 
 ## Demo
 
@@ -18,25 +18,25 @@ planner = IGBNN_mu(...)
 
 ## Paper
 
-**Title:** *IGBNN-μ: Complete Coverage Path Planning for Scalable Inter-Reconfigurable Robots*
-**Authors:** Ash Yaw Sang Wan, Mohan Rajesh Elara
-**Venue:** IEEE *Transactions on Systems, Man, and Cybernetics: Systems*
-**DOI:** _TODO — add once issued_
+**Title:** *Complete Coverage Path Planning by IGBNN-μ for Scalable Inter-Reconfigurable Robots*
+**Authors:** Ash Yaw Sang Wan, Jiao Yang, Mohan Rajesh Elara, Anh Vu Le
+**Venue:** [IEEE *Transactions on Systems, Man, and Cybernetics: Systems*](https://ieeexplore.ieee.org/document/11700393), early access, pp. 1–14, 2026
+**DOI:** [10.1109/TSMC.2026.3731065](https://doi.org/10.1109/TSMC.2026.3731065)
 
 ## Cite
 
 ```bibtex
-@article{wan_igbnnmu,
-  title   = {{IGBNN}-$\mu$: Complete Coverage Path Planning for Scalable Inter-Reconfigurable Robots},
-  author  = {Wan, Ash Yaw Sang and Elara, Mohan Rajesh},
+@article{wan2026complete,
+  title   = {Complete Coverage Path Planning by {IGBNN}-$\mu$ for Scalable Inter-Reconfigurable Robots},
+  author  = {Wan, Ash Yaw Sang and Yang, Jiao and Elara, Mohan Rajesh and Le, Anh Vu},
   journal = {IEEE Transactions on Systems, Man, and Cybernetics: Systems},
-  year    = {TODO},
-  volume  = {TODO},
-  pages   = {TODO},
-  doi     = {TODO}
+  pages   = {1--14},
+  year    = {2026},
+  publisher = {IEEE},
+  doi     = {10.1109/TSMC.2026.3731065}
 }
 ```
 
 ## Funding
 
-_TODO — the submitted manuscript carries no acknowledgement section (stripped for double-blind review); copy the funding statement across from the camera-ready._
+This research was supported by the National Robotics Programme under its National Robotics Programme 2.0, *LEO 1.0: A New Class of Bed Making Robot*, Award No. **M25N4N2028**, and by A\*STAR under its *RIE2025 IAF-PP — Modular Reconfigurable Mobile Robots (MR)²* programme, Grant No. **M24N2a0039**.

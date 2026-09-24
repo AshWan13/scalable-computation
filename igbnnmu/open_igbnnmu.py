@@ -38,7 +38,7 @@ components, per Section III:
   4. Reduced decision space (III-C)       — only morphology-consistent
      neighbours are scored.                       _nav_nbrs(), _next_wp()
 
-Measured gain: coverage effort per robot FALLS as the team grows (O(log n)^-1),
+Measured gain: coverage effort per robot FALLS as the team grows (O((log n)^-1)),
 the inverse of standard multi-robot GBNN's O(n).
 
 State vs activity
